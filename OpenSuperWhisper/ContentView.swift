@@ -776,7 +776,8 @@ struct RecordingRow: View {
     }
     
     private var isPending: Bool {
-        recording.status == .pending || recording.status == .converting || recording.status == .transcribing
+        recording.status == .pending || recording.status == .converting ||
+            recording.status == .transcribing || recording.status == .deleting
     }
     
     private var isRegenerating: Bool {
@@ -795,6 +796,8 @@ struct RecordingRow: View {
             return ""
         case .failed:
             return "Failed"
+        case .deleting:
+            return "Deleting..."
         }
     }
     

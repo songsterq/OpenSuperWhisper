@@ -99,7 +99,9 @@ private final class QueueInputCapturingFluidAudioEngine: FluidAudioEngine {
     private let lock = NSLock()
     private var inputsStorage: [Input] = []
     private var heldFileContinuation: CheckedContinuation<String, Error>?
+    private var heldPCMContinuation: CheckedContinuation<String, Error>?
     private var shouldHoldNextFile = true
+    private var shouldHoldNextPCM = false
     private var successfulPCMText: String?
 
     override var isModelLoaded: Bool { true }
@@ -128,18 +130,43 @@ private final class QueueInputCapturingFluidAudioEngine: FluidAudioEngine {
     }
 
     override func transcribeSamples(_ samples: [Float], settings: Settings) async throws -> String {
-        lock.lock()
-        inputsStorage.append(.pcm(samples))
-        let text = successfulPCMText
-        lock.unlock()
-        if let text { return text }
-        throw CapturedInputError()
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            inputsStorage.append(.pcm(samples))
+            let text = successfulPCMText
+            if shouldHoldNextPCM {
+                shouldHoldNextPCM = false
+                heldPCMContinuation = continuation
+                lock.unlock()
+            } else {
+                lock.unlock()
+                if let text {
+                    continuation.resume(returning: text)
+                } else {
+                    continuation.resume(throwing: CapturedInputError())
+                }
+            }
+        }
     }
 
     func succeedPCM(with text: String) {
         lock.lock()
         successfulPCMText = text
         lock.unlock()
+    }
+
+    func holdNextPCM() {
+        lock.lock()
+        shouldHoldNextPCM = true
+        lock.unlock()
+    }
+
+    func completeHeldPCM(with text: String) {
+        lock.lock()
+        let continuation = heldPCMContinuation
+        heldPCMContinuation = nil
+        lock.unlock()
+        continuation?.resume(returning: text)
     }
 
     func completeHeldFile() {
@@ -442,6 +469,52 @@ final class TranscriptionCancellationTests: XCTestCase {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         try await store.deleteAllRecordingsSync()
+    }
+
+    func testDeletingActiveQueuedDictationCannotBeRefetched() async throws {
+        let engine = QueueInputCapturingFluidAudioEngine()
+        engine.holdNextPCM()
+        let service = TranscriptionService(engine: engine)
+        let store = try RecordingStore(databaseQueue: DatabaseQueue())
+        let queue = TranscriptionQueue(transcriptionService: service, recordingStore: store)
+        let source = FileManager.default.temporaryDirectory
+            .appendingPathComponent("osw-delete-active-\(UUID()).wav")
+        try Data([1, 2, 3]).write(to: source)
+
+        await queue.addRecordedAudioToQueue(RecordedAudio(url: source, samples: [0.25]))
+        for _ in 0..<100 where engine.inputs.isEmpty || queue.currentRecordingId == nil {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let row = try XCTUnwrap(try store.getPendingRecordings().first)
+        let preparedURL = URL(fileURLWithPath: try XCTUnwrap(row.preparedPCMFileURL))
+
+        let deletion = Task {
+            try await store.deleteRecordingSync(
+                row,
+                cancelTranscription: true,
+                cancelAndWait: { id in await queue.cancelRecordingAndWait(id) }
+            )
+        }
+        var tombstone: Recording?
+        for _ in 0..<100 {
+            tombstone = try await store.fetchRecordings(limit: 1, offset: 0).first
+            if tombstone?.status == .deleting { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(tombstone?.status, .deleting)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: preparedURL.path))
+
+        engine.completeHeldPCM(with: "late result")
+        try await deletion.value
+        for _ in 0..<100 where queue.isProcessing {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertEqual(engine.inputs, [.pcm([0.25])])
+        let remaining = try await store.fetchRecordings(limit: 1, offset: 0)
+        XCTAssertTrue(remaining.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: preparedURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: row.url.path))
     }
 
     func testQueuedDictationRecoversPCMAfterQueueRecreation() async throws {

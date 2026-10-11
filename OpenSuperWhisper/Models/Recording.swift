@@ -7,6 +7,7 @@ enum RecordingStatus: String, Codable {
     case transcribing
     case completed
     case failed
+    case deleting
 }
 
 struct Recording: Identifiable, Codable, FetchableRecord, PersistableRecord, Equatable {
@@ -82,13 +83,19 @@ class RecordingStore: ObservableObject {
     @Published private(set) var recordings: [Recording] = []
     private let dbQueue: DatabaseQueue?
     private let initializationError: Error?
+    private let reconcilesOrphanedArtifacts: Bool
+    private var stagingQueueArtifactIDs: Set<UUID> = []
 
     private convenience init() {
         let directory = Recording.recordingsDirectory.deletingLastPathComponent()
-        self.init(databaseURL: directory.appendingPathComponent("recordings.sqlite"))
+        self.init(
+            databaseURL: directory.appendingPathComponent("recordings.sqlite"),
+            reconcilesOrphanedArtifacts: true
+        )
     }
 
-    init(databaseURL: URL) {
+    init(databaseURL: URL, reconcilesOrphanedArtifacts: Bool = false) {
+        self.reconcilesOrphanedArtifacts = reconcilesOrphanedArtifacts
         do {
             try FileManager.default.createDirectory(at: databaseURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let database = try DatabaseQueue(path: databaseURL.path)
@@ -103,6 +110,7 @@ class RecordingStore: ObservableObject {
     }
 
     init(databaseQueue: DatabaseQueue) throws {
+        reconcilesOrphanedArtifacts = false
         try Self.setupDatabase(databaseQueue)
         dbQueue = databaseQueue
         initializationError = nil
@@ -200,6 +208,8 @@ class RecordingStore: ObservableObject {
 
     func addQueuedRecording(url: URL, duration: TimeInterval, pcmSamples: [Float]?) async throws {
         let id = UUID()
+        stagingQueueArtifactIDs.insert(id)
+        defer { stagingQueueArtifactIDs.remove(id) }
         let fileName = Recording.fileName(for: id)
         let preparedPCMURL = pcmSamples.map { _ in QueuedPCMFile.url(for: id) }
         let durableSourceURL = pcmSamples.map {
@@ -256,17 +266,23 @@ class RecordingStore: ObservableObject {
 
     func saveFailedDictation(_ audio: RecordedAudio, error: Error) async throws -> Recording {
         let id = UUID()
+        stagingQueueArtifactIDs.insert(id)
+        defer { stagingQueueArtifactIDs.remove(id) }
         let alreadySaved = audio.url.deletingLastPathComponent().standardizedFileURL == Recording.recordingsDirectory.standardizedFileURL
         let name = alreadySaved ? audio.url.lastPathComponent : Recording.fileName(for: id)
         let destination = Recording.recordingsDirectory.appendingPathComponent(name)
-        if !alreadySaved {
-            try AudioRecorder.shared.moveTemporaryRecording(from: audio.url, to: destination)
-        }
         let preparedPCMURL = QueuedPCMFile.url(for: id)
         do {
             try QueuedPCMFile.write(audio.samples, to: preparedPCMURL)
+            if !alreadySaved {
+                try AudioRecorder.shared.moveTemporaryRecording(from: audio.url, to: destination)
+            }
         } catch {
-            throw PreservedAudioError(url: destination, underlying: error)
+            try? FileManager.default.removeItem(at: preparedPCMURL)
+            let preservedURL = FileManager.default.fileExists(atPath: destination.path)
+                ? destination
+                : audio.url
+            throw PreservedAudioError(url: preservedURL, underlying: error)
         }
         let row = Recording(
             id: id,
@@ -387,32 +403,38 @@ class RecordingStore: ObservableObject {
     /// ~100 SQLite transactions per transcription. Status transitions are still
     /// persisted by the explicit update methods.
     func updateRecordingProgressTransient(_ id: UUID, progress: Float, status: RecordingStatus) {
+        if recordings.first(where: { $0.id == id })?.status == .deleting { return }
         applyLocalProgressUpdate(id, progress: progress, status: status)
     }
     
     func updateRecordingProgressOnlySync(_ id: UUID, transcription: String, progress: Float, status: RecordingStatus, isRegeneration: Bool? = nil) async throws {
-        _ = try await database().write { db -> Int in
+        let updated = try await database().write { db -> Int in
             try Recording
                 .filter(Recording.Columns.id == id)
+                .filter(Recording.Columns.status != RecordingStatus.deleting.rawValue)
                 .updateAll(db, [
                     Recording.Columns.transcription.set(to: transcription),
                     Recording.Columns.progress.set(to: progress),
                     Recording.Columns.status.set(to: status.rawValue)
                 ])
         }
-        applyLocalProgressUpdate(id, transcription: transcription, progress: progress, status: status, isRegeneration: isRegeneration)
+        if updated > 0 {
+            applyLocalProgressUpdate(id, transcription: transcription, progress: progress, status: status, isRegeneration: isRegeneration)
+        }
     }
 
     func completeRecording(_ recording: Recording, transcription: String) async throws {
-        _ = try await database().write { db -> Int in
+        let updated = try await database().write { db -> Int in
             try Recording
                 .filter(Recording.Columns.id == recording.id)
+                .filter(Recording.Columns.status != RecordingStatus.deleting.rawValue)
                 .updateAll(db, [
                     Recording.Columns.transcription.set(to: transcription),
                     Recording.Columns.progress.set(to: Float(1.0)),
                     Recording.Columns.status.set(to: RecordingStatus.completed.rawValue)
                 ])
         }
+        guard updated > 0 else { return }
         applyLocalProgressUpdate(
             recording.id,
             transcription: transcription,
@@ -435,6 +457,14 @@ class RecordingStore: ObservableObject {
         }
     }
 
+    func reconcileQueueArtifactLifecycle() async throws {
+        try await retryCompletedPreparedPCMCleanup()
+        try await retryDeletingRecordings()
+        if reconcilesOrphanedArtifacts {
+            try await reconcileOrphanedQueueArtifacts()
+        }
+    }
+
     nonisolated func updateSourceFileURL(_ id: UUID, sourceURL: String) async throws {
         try await database().write { db in
             try Recording
@@ -446,15 +476,20 @@ class RecordingStore: ObservableObject {
     }
 
     func updateRecordingStatusOnly(_ id: UUID, progress: Float, status: RecordingStatus, isRegeneration: Bool? = nil) async throws {
-        _ = try await database().write { db -> Int in
-            try Recording
-                .filter(Recording.Columns.id == id)
+        let updated = try await database().write { db -> Int in
+            var request = Recording.filter(Recording.Columns.id == id)
+            if status != .deleting {
+                request = request.filter(Recording.Columns.status != RecordingStatus.deleting.rawValue)
+            }
+            return try request
                 .updateAll(db, [
                     Recording.Columns.progress.set(to: progress),
                     Recording.Columns.status.set(to: status.rawValue)
                 ])
         }
-        applyLocalProgressUpdate(id, progress: progress, status: status, isRegeneration: isRegeneration)
+        if updated > 0 {
+            applyLocalProgressUpdate(id, progress: progress, status: status, isRegeneration: isRegeneration)
+        }
     }
 
     private nonisolated func updateRecordingInDB(_ recording: Recording) async throws {
@@ -470,16 +505,22 @@ class RecordingStore: ObservableObject {
         }
     }
 
-    func deleteRecordingSync(_ recording: Recording, cancelTranscription: Bool = true) async throws {
+    func deleteRecordingSync(
+        _ recording: Recording,
+        cancelTranscription: Bool = true,
+        cancelAndWait: ((UUID) async -> Void)? = nil
+    ) async throws {
+        guard let deletingRecording = try await markRecordingsForDeletion([recording.id]).first else {
+            return
+        }
         if cancelTranscription && recording.isPending {
-            await TranscriptionQueue.shared.cancelRecordingAndWait(recording.id)
+            if let cancelAndWait {
+                await cancelAndWait(recording.id)
+            } else {
+                await TranscriptionQueue.shared.cancelRecordingAndWait(recording.id)
+            }
         }
-        try Self.removePreparedPCMFile(for: recording)
-        try await database().write { db in _ = try recording.delete(db) }
-        defer { NotificationCenter.default.post(name: Self.recordingsDidUpdateNotification, object: nil) }
-        if FileManager.default.fileExists(atPath: recording.url.path) {
-            try FileManager.default.removeItem(at: recording.url)
-        }
+        try await finishDeletingRecording(deletingRecording)
     }
 
     func deleteAllRecordings() {
@@ -491,17 +532,11 @@ class RecordingStore: ObservableObject {
 
     func deleteAllRecordingsSync() async throws {
         await TranscriptionQueue.shared.stopProcessingQueue()
-        let removed = try await database().read { db in
-            try Recording.fetchAll(db)
+        let ids = try await database().read { db in
+            try Recording.fetchAll(db).map(\.id)
         }
-        for recording in removed {
-            try Self.removePreparedPCMFile(for: recording)
-        }
-        try await database().write { db in _ = try Recording.deleteAll(db) }
-        defer { NotificationCenter.default.post(name: Self.recordingsDidUpdateNotification, object: nil) }
-        for recording in removed where FileManager.default.fileExists(atPath: recording.url.path) {
-            try FileManager.default.removeItem(at: recording.url)
-        }
+        let recordings = try await markRecordingsForDeletion(ids)
+        try await finishDeletingRecordings(recordings)
     }
 
     nonisolated static func retentionCutoffDate(daysToKeep: Int, now: Date = Date()) -> Date? {
@@ -527,6 +562,7 @@ class RecordingStore: ObservableObject {
             let request = Recording
                 .filter(Recording.Columns.timestamp < cutoff)
                 .filter(!Self.pendingStatuses.contains(Recording.Columns.status))
+                .filter(Recording.Columns.status != RecordingStatus.deleting.rawValue)
             let count = try request.fetchCount(db)
             let oldest = try request
                 .order(Recording.Columns.timestamp.asc)
@@ -542,23 +578,14 @@ class RecordingStore: ObservableObject {
             try Recording
                 .filter(Recording.Columns.timestamp < cutoff)
                 .filter(!Self.pendingStatuses.contains(Recording.Columns.status))
+                .filter(Recording.Columns.status != RecordingStatus.deleting.rawValue)
                 .fetchAll(db)
         }
         guard !outdated.isEmpty else { return }
 
-        for recording in outdated {
-            try Self.removePreparedPCMFile(for: recording)
-        }
         let ids = outdated.map(\.id)
-        try await database().write { db in
-            _ = try Recording
-                .filter(ids.contains(Recording.Columns.id))
-                .deleteAll(db)
-        }
-        for recording in outdated where Self.isDeletableRecordingURL(recording.url) {
-            try? FileManager.default.removeItem(at: recording.url)
-        }
-        NotificationCenter.default.post(name: Self.recordingsDidUpdateNotification, object: nil)
+        let recordings = try await markRecordingsForDeletion(ids)
+        try await finishDeletingRecordings(recordings)
     }
 
     nonisolated static func removePreparedPCMFile(for recording: Recording) throws {
@@ -585,6 +612,96 @@ class RecordingStore: ObservableObject {
         }
         if let index = recordings.firstIndex(where: { $0.id == recording.id }) {
             recordings[index].preparedPCMFileURL = nil
+        }
+    }
+
+    private func markRecordingsForDeletion(_ ids: [UUID]) async throws -> [Recording] {
+        guard !ids.isEmpty else { return [] }
+        let recordings = try await database().write { db in
+            _ = try Recording
+                .filter(ids.contains(Recording.Columns.id))
+                .updateAll(db, [Recording.Columns.status.set(to: RecordingStatus.deleting.rawValue)])
+            return try Recording
+                .filter(ids.contains(Recording.Columns.id))
+                .fetchAll(db)
+        }
+        for recording in recordings {
+            applyLocalProgressUpdate(
+                recording.id,
+                progress: recording.progress,
+                status: .deleting
+            )
+        }
+        return recordings
+    }
+
+    private func finishDeletingRecording(_ recording: Recording) async throws {
+        try Self.removePreparedPCMFile(for: recording)
+        if FileManager.default.fileExists(atPath: recording.url.path) {
+            try FileManager.default.removeItem(at: recording.url)
+        }
+        try await database().write { db in
+            _ = try Recording
+                .filter(Recording.Columns.id == recording.id)
+                .filter(Recording.Columns.status == RecordingStatus.deleting.rawValue)
+                .deleteAll(db)
+        }
+        NotificationCenter.default.post(name: Self.recordingsDidUpdateNotification, object: nil)
+    }
+
+    private func finishDeletingRecordings(_ recordings: [Recording]) async throws {
+        var firstError: Error?
+        for recording in recordings {
+            do {
+                try await finishDeletingRecording(recording)
+            } catch {
+                if firstError == nil { firstError = error }
+            }
+        }
+        if let firstError { throw firstError }
+    }
+
+    func retryDeletingRecordings() async throws {
+        let recordings = try await database().read { db in
+            try Recording
+                .filter(Recording.Columns.status == RecordingStatus.deleting.rawValue)
+                .fetchAll(db)
+        }
+        for recording in recordings {
+            try? await finishDeletingRecording(recording)
+        }
+    }
+
+    func reconcileOrphanedQueueArtifacts(
+        artifactDirectory: URL = QueuedPCMFile.directory,
+        recordingsDirectory: URL = Recording.recordingsDirectory
+    ) async throws {
+        let referencedPaths = Set(try await database().read { db in
+            try Recording
+                .filter(Recording.Columns.preparedPCMFileURL != nil)
+                .fetchAll(db)
+                .compactMap(\.preparedPCMFileURL)
+        }.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
+        guard let artifacts = try? FileManager.default.contentsOfDirectory(
+            at: artifactDirectory,
+            includingPropertiesForKeys: nil
+        ) else { return }
+
+        for artifact in artifacts {
+            let standardized = artifact.standardizedFileURL
+            if referencedPaths.contains(standardized.path) { continue }
+            if stagingQueueArtifactIDs.contains(where: {
+                artifact.lastPathComponent.contains($0.uuidString)
+            }) { continue }
+            if artifact.pathExtension == "wav",
+               let id = UUID(uuidString: artifact.deletingPathExtension().lastPathComponent) {
+                let sourceURL = recordingsDirectory
+                    .appendingPathComponent(Recording.fileName(for: id))
+                if FileManager.default.fileExists(atPath: sourceURL.path) {
+                    try FileManager.default.removeItem(at: sourceURL)
+                }
+            }
+            try FileManager.default.removeItem(at: artifact)
         }
     }
 
@@ -623,16 +740,23 @@ class RecordingStore: ObservableObject {
         }
     }
 
-    nonisolated static func recordingsDiskUsage() -> Int64 {
-        let fileManager = FileManager.default
-        guard let files = try? fileManager.contentsOfDirectory(
-            at: Recording.recordingsDirectory,
-            includingPropertiesForKeys: [.fileSizeKey]
-        ) else { return 0 }
+    nonisolated static func recordingsDiskUsage(
+        recordingsDirectory: URL = Recording.recordingsDirectory,
+        preparedPCMDirectory: URL = QueuedPCMFile.directory
+    ) -> Int64 {
+        fileSize(in: recordingsDirectory) + fileSize(in: preparedPCMDirectory)
+    }
 
+    private nonisolated static func fileSize(in directory: URL) -> Int64 {
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .fileSizeKey]
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: Array(keys)
+        ) else { return 0 }
         return files.reduce(Int64(0)) { total, url in
-            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
-            return total + Int64(size)
+            guard let values = try? url.resourceValues(forKeys: keys),
+                  values.isRegularFile == true else { return total }
+            return total + Int64(values.fileSize ?? 0)
         }
     }
 

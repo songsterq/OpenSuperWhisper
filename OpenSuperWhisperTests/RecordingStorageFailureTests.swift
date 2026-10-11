@@ -16,7 +16,7 @@ final class RecordingStorageFailureTests: XCTestCase {
         } catch {}
     }
 
-    func testFailedDeletionPreservesAudioDatabaseAndVisibleRow() async throws {
+    func testFailedDeletionLeavesRetryableTombstone() async throws {
         let db = try DatabaseQueue()
         let store = try RecordingStore(databaseQueue: db)
         let id = UUID()
@@ -39,14 +39,21 @@ final class RecordingStorageFailureTests: XCTestCase {
         }
         XCTAssertNotNil(AppErrorCenter.shared.issue)
         XCTAssertEqual(vm.recordings.map(\.id), [id])
-        XCTAssertEqual(try Data(contentsOf: row.url), Data([1, 2, 3]))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: row.url.path))
         do {
             try await store.deleteAllRecordingsSync()
             XCTFail("Deletion should fail")
         } catch {}
-        XCTAssertTrue(FileManager.default.fileExists(atPath: row.url.path))
         let rows = try await store.fetchRecordings(limit: 10, offset: 0)
         XCTAssertEqual(rows.map(\.id), [id])
+        XCTAssertEqual(rows.first?.status, .deleting)
+
+        try await db.write { db in
+            try db.execute(sql: "DROP TRIGGER reject_delete")
+        }
+        try await store.retryDeletingRecordings()
+        let remaining = try await store.fetchRecordings(limit: 10, offset: 0)
+        XCTAssertTrue(remaining.isEmpty)
     }
 
     func testFailedInsertIsReturnedToCaller() async throws {

@@ -75,7 +75,7 @@ class TranscriptionQueue: ObservableObject {
 
         processingTask = Task {
             do {
-                try await recordingStore.retryCompletedPreparedPCMCleanup()
+                try await recordingStore.reconcileQueueArtifactLifecycle()
                 try await cleanupMissingFiles()
                 try await processQueue()
             } catch is CancellationError {

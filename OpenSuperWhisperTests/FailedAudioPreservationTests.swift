@@ -68,6 +68,7 @@ final class FailedAudioPreservationTests: XCTestCase {
             case completed
             case deleted
             case interruptedCompletion
+            case interruptedDeletion
         }
 
         for event in TerminalEvent.allCases {
@@ -96,6 +97,9 @@ final class FailedAudioPreservationTests: XCTestCase {
                 try await store.updateRecordingStatusOnly(row.id, progress: 1, status: .completed)
                 try FileManager.default.removeItem(at: preparedURL)
                 try await store.retryCompletedPreparedPCMCleanup()
+            case .interruptedDeletion:
+                try await store.updateRecordingStatusOnly(row.id, progress: 0, status: .deleting)
+                try await store.retryDeletingRecordings()
             }
 
             let persisted = try await store.fetchRecordings(limit: 1, offset: 0).first
@@ -107,7 +111,7 @@ final class FailedAudioPreservationTests: XCTestCase {
                 XCTAssertEqual(persisted?.status, .completed, "\(event)")
                 XCTAssertNil(persisted?.preparedPCMFileURL, "\(event)")
                 XCTAssertFalse(FileManager.default.fileExists(atPath: preparedURL.path), "\(event)")
-            case .deleted:
+            case .deleted, .interruptedDeletion:
                 XCTAssertNil(persisted, "\(event)")
                 XCTAssertFalse(FileManager.default.fileExists(atPath: preparedURL.path), "\(event)")
             }
@@ -178,5 +182,66 @@ final class FailedAudioPreservationTests: XCTestCase {
         persisted = try XCTUnwrap(fetched.first)
         XCTAssertNil(persisted.preparedPCMFileURL)
         XCTAssertFalse(FileManager.default.fileExists(atPath: preparedURL.path))
+    }
+
+    func testStartupReconcilesOnlyUnreferencedQueueArtifacts() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pcm-orphans-\(UUID())", isDirectory: true)
+        let artifactDirectory = directory.appendingPathComponent("prepared-pcm", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = try RecordingStore(databaseQueue: DatabaseQueue())
+        let orphanID = UUID()
+        let orphanArtifact = artifactDirectory.appendingPathComponent("\(orphanID.uuidString).wav")
+        let orphanSource = directory.appendingPathComponent(Recording.fileName(for: orphanID))
+        let interruptedWrite = artifactDirectory.appendingPathComponent(".\(UUID()).partial.wav")
+        try Data([1]).write(to: orphanArtifact)
+        try Data([2]).write(to: orphanSource)
+        try Data([3]).write(to: interruptedWrite)
+
+        let referencedID = UUID()
+        let referencedArtifact = artifactDirectory.appendingPathComponent("\(referencedID.uuidString).wav")
+        try Data([4]).write(to: referencedArtifact)
+        let referenced = Recording(
+            id: referencedID,
+            timestamp: Date(),
+            fileName: Recording.fileName(for: referencedID),
+            transcription: "",
+            duration: 1,
+            status: .failed,
+            progress: 0,
+            sourceFileURL: directory.appendingPathComponent(Recording.fileName(for: referencedID)).path,
+            preparedPCMFileURL: referencedArtifact.path
+        )
+        try await store.addRecordingSync(referenced)
+
+        try await store.reconcileOrphanedQueueArtifacts(
+            artifactDirectory: artifactDirectory,
+            recordingsDirectory: directory
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: orphanArtifact.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: orphanSource.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: interruptedWrite.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: referencedArtifact.path))
+    }
+
+    func testDiskUsageIncludesPreparedPCMDirectory() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pcm-usage-\(UUID())", isDirectory: true)
+        let artifactDirectory = directory.appendingPathComponent("prepared-pcm", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data(repeating: 1, count: 3).write(to: directory.appendingPathComponent("recording.wav"))
+        try Data(repeating: 2, count: 5).write(to: artifactDirectory.appendingPathComponent("prepared.wav"))
+
+        XCTAssertEqual(
+            RecordingStore.recordingsDiskUsage(
+                recordingsDirectory: directory,
+                preparedPCMDirectory: artifactDirectory
+            ),
+            8
+        )
     }
 }
