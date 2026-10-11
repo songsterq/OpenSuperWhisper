@@ -14,7 +14,6 @@ class TranscriptionQueue: ObservableObject {
     private var currentOperationID: UUID?
     private var currentTranscriptionTask: Task<Void, Error>?
     private var cancelledRecordingIds: Set<UUID> = []
-    private var queuedPCMSamples: [UUID: [Float]] = [:]
     private var progressCancellable: AnyCancellable?
 
     init(transcriptionService: TranscriptionService = .shared, recordingStore: RecordingStore = .shared) {
@@ -108,7 +107,6 @@ class TranscriptionQueue: ObservableObject {
         }.value
         
         for recording in recordingsToDelete {
-            queuedPCMSamples[recording.id] = nil
             try await recordingStore.deleteRecordingSync(recording, cancelTranscription: false)
         }
     }
@@ -137,6 +135,13 @@ class TranscriptionQueue: ObservableObject {
             let timestamp = Date()
             let id = UUID()
             let fileName = Recording.fileName(for: id)
+            let preparedPCMURL = pcmSamples.map { _ in QueuedPCMFile.url(for: url) }
+
+            if let pcmSamples, let preparedPCMURL {
+                try await Task.detached(priority: .userInitiated) {
+                    try QueuedPCMFile.write(pcmSamples, to: preparedPCMURL)
+                }.value
+            }
 
             let recording = Recording(
                 id: id,
@@ -146,11 +151,18 @@ class TranscriptionQueue: ObservableObject {
                 duration: duration,
                 status: .pending,
                 progress: 0.0,
-                sourceFileURL: url.path
+                sourceFileURL: url.path,
+                preparedPCMFileURL: preparedPCMURL?.path
             )
 
-            try await recordingStore.addRecordingSync(recording)
-            queuedPCMSamples[id] = pcmSamples
+            do {
+                try await recordingStore.addRecordingSync(recording)
+            } catch {
+                if let preparedPCMURL {
+                    try? FileManager.default.removeItem(at: preparedPCMURL)
+                }
+                throw error
+            }
 
             startProcessingQueue()
         } catch {
@@ -212,9 +224,6 @@ class TranscriptionQueue: ObservableObject {
     }
 
     private func processRecording(_ recording: Recording) async throws {
-        let pcmSamples = queuedPCMSamples[recording.id]
-        defer { queuedPCMSamples[recording.id] = nil }
-
         if isRecordingCancelled(recording.id) {
             clearCancellation(recording.id)
             return
@@ -278,6 +287,10 @@ class TranscriptionQueue: ObservableObject {
                 }
 
                 let settings = Settings()
+                let pcmSamples = try await Task.detached(priority: .userInitiated) {
+                    guard let path = recording.preparedPCMFileURL else { return nil }
+                    return try QueuedPCMFile.read(from: URL(fileURLWithPath: path))
+                }.value
                 let text = try await transcriptionService.transcribeAudio(
                     url: sourceURL,
                     settings: settings,
@@ -315,13 +328,8 @@ class TranscriptionQueue: ObservableObject {
                     }
                 }.value
 
-                try await recordingStore.updateRecordingProgressOnlySync(
-                    recording.id,
-                    transcription: text,
-                    progress: 1.0,
-                    status: .completed,
-                    isRegeneration: false
-                )
+                try await recordingStore.completeRecording(recording.id, transcription: text)
+                try? RecordingStore.removePreparedPCMFile(for: recording)
 
             } catch {
                 if !isRecordingCancelled(recording.id) && !Task.isCancelled {

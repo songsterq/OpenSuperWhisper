@@ -18,11 +18,13 @@ struct Recording: Identifiable, Codable, FetchableRecord, PersistableRecord, Equ
     var status: RecordingStatus
     var progress: Float
     var sourceFileURL: String?
+    var preparedPCMFileURL: String? = nil
     
     var isRegeneration: Bool = false
     
     enum CodingKeys: String, CodingKey {
-        case id, timestamp, fileName, transcription, duration, status, progress, sourceFileURL
+        case id, timestamp, fileName, transcription, duration, status, progress, sourceFileURL,
+             preparedPCMFileURL
     }
 
     static func == (lhs: Recording, rhs: Recording) -> Bool {
@@ -69,6 +71,7 @@ struct Recording: Identifiable, Codable, FetchableRecord, PersistableRecord, Equ
         static let status = Column(CodingKeys.status)
         static let progress = Column(CodingKeys.progress)
         static let sourceFileURL = Column(CodingKeys.sourceFileURL)
+        static let preparedPCMFileURL = Column(CodingKeys.preparedPCMFileURL)
     }
 }
 
@@ -141,6 +144,15 @@ class RecordingStore: ObservableObject {
             if !columnNames.contains("sourceFileURL") {
                 try db.alter(table: Recording.databaseTableName) { t in
                     t.add(column: "sourceFileURL", .text)
+                }
+            }
+        }
+
+        migrator.registerMigration("v3_add_prepared_pcm_file_url") { db in
+            let columns = try db.columns(in: Recording.databaseTableName)
+            if !columns.contains(where: { $0.name == "preparedPCMFileURL" }) {
+                try db.alter(table: Recording.databaseTableName) { table in
+                    table.add(column: "preparedPCMFileURL", .text)
                 }
             }
         }
@@ -317,6 +329,29 @@ class RecordingStore: ObservableObject {
         applyLocalProgressUpdate(id, transcription: transcription, progress: progress, status: status, isRegeneration: isRegeneration)
     }
 
+    func completeRecording(_ id: UUID, transcription: String) async throws {
+        _ = try await database().write { db -> Int in
+            try Recording
+                .filter(Recording.Columns.id == id)
+                .updateAll(db, [
+                    Recording.Columns.transcription.set(to: transcription),
+                    Recording.Columns.progress.set(to: Float(1.0)),
+                    Recording.Columns.status.set(to: RecordingStatus.completed.rawValue),
+                    Recording.Columns.preparedPCMFileURL.set(to: nil)
+                ])
+        }
+        applyLocalProgressUpdate(
+            id,
+            transcription: transcription,
+            progress: 1.0,
+            status: .completed,
+            isRegeneration: false
+        )
+        if let index = recordings.firstIndex(where: { $0.id == id }) {
+            recordings[index].preparedPCMFileURL = nil
+        }
+    }
+
     nonisolated func updateSourceFileURL(_ id: UUID, sourceURL: String) async throws {
         try await database().write { db in
             try Recording
@@ -361,6 +396,7 @@ class RecordingStore: ObservableObject {
         if FileManager.default.fileExists(atPath: recording.url.path) {
             try FileManager.default.removeItem(at: recording.url)
         }
+        try Self.removePreparedPCMFile(for: recording)
     }
 
     func deleteAllRecordings() {
@@ -380,6 +416,9 @@ class RecordingStore: ObservableObject {
         defer { NotificationCenter.default.post(name: Self.recordingsDidUpdateNotification, object: nil) }
         for recording in removed where FileManager.default.fileExists(atPath: recording.url.path) {
             try FileManager.default.removeItem(at: recording.url)
+        }
+        for recording in removed {
+            try Self.removePreparedPCMFile(for: recording)
         }
     }
 
@@ -434,7 +473,19 @@ class RecordingStore: ObservableObject {
         for recording in outdated where Self.isDeletableRecordingURL(recording.url) {
             try? FileManager.default.removeItem(at: recording.url)
         }
+        for recording in outdated {
+            try? Self.removePreparedPCMFile(for: recording)
+        }
         NotificationCenter.default.post(name: Self.recordingsDidUpdateNotification, object: nil)
+    }
+
+    nonisolated static func removePreparedPCMFile(for recording: Recording) throws {
+        guard let path = recording.preparedPCMFileURL,
+              let sourcePath = recording.sourceFileURL else { return }
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        let expected = QueuedPCMFile.url(for: URL(fileURLWithPath: sourcePath)).standardizedFileURL
+        guard url == expected, FileManager.default.fileExists(atPath: url.path) else { return }
+        try FileManager.default.removeItem(at: url)
     }
 
     /// Recordings created through the indicator flow used to be saved with

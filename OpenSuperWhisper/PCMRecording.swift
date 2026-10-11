@@ -13,6 +13,63 @@ struct RecordingCaptureError: Error {
     let underlying: Error
 }
 
+enum QueuedPCMFile {
+    static func url(for sourceURL: URL) -> URL {
+        sourceURL.appendingPathExtension("prepared.wav")
+    }
+
+    static func write(_ samples: [Float], to url: URL) throws {
+        guard samples.count <= Int(UInt32.max) else {
+            throw TranscriptionError.audioConversionFailed
+        }
+        guard let format = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 16000,
+            channels: 1,
+            interleaved: false
+        ), let buffer = AVAudioPCMBuffer(
+            pcmFormat: format,
+            frameCapacity: AVAudioFrameCount(max(samples.count, 1))
+        ) else {
+            throw TranscriptionError.audioConversionFailed
+        }
+
+        buffer.frameLength = AVAudioFrameCount(samples.count)
+        samples.withUnsafeBufferPointer { source in
+            guard let baseAddress = source.baseAddress else { return }
+            buffer.floatChannelData![0].update(from: baseAddress, count: samples.count)
+        }
+        let file = try AVAudioFile(
+            forWriting: url,
+            settings: format.settings,
+            commonFormat: .pcmFormatFloat32,
+            interleaved: false
+        )
+        try file.write(from: buffer)
+    }
+
+    static func read(from url: URL) throws -> [Float] {
+        let file = try AVAudioFile(forReading: url)
+        let format = file.processingFormat
+        guard format.sampleRate == 16000,
+              format.channelCount == 1,
+              file.length >= 0,
+              file.length <= AVAudioFramePosition(UInt32.max),
+              let buffer = AVAudioPCMBuffer(
+                pcmFormat: format,
+                frameCapacity: AVAudioFrameCount(max(file.length, 1))
+              ) else {
+            throw TranscriptionError.audioConversionFailed
+        }
+
+        try file.read(into: buffer)
+        guard let samples = buffer.floatChannelData?[0] else {
+            throw TranscriptionError.audioConversionFailed
+        }
+        return Array(UnsafeBufferPointer(start: samples, count: Int(buffer.frameLength)))
+    }
+}
+
 final class PCMRecordingWriter {
     private let url: URL
     private var file: AVAudioFile?

@@ -1,0 +1,58 @@
+{
+  "fixtureDurationSeconds" : 97.106,
+  "fixturePath" : "/Users/shin/.no-mistakes/worktrees/63e6e6b5f766/01M4N8714KYFSDHXCYNA47NTTM/OpenSuperWhisperTests/Fixtures/long_en.m4a",
+  "fixtureSHA256" : "34c051c05fd076777903aae3694aef7386e9ad92126996cc3839655df1adf691",
+  "fluidAudioVersion" : "0.15.6",
+  "generatedAt" : "2026-10-11T12:44:46Z",
+  "interpretation" : "This isolates file decoding, conversion, and input-routing overhead before the same Parakeet v3 model/runtime. It excludes model loading and does not compare Parakeet with Whisper.",
+  "measuredRunsPerRoute" : 5,
+  "measuredTranscriptsMatched" : true,
+  "methodology" : "One process and one loaded AsrManager; a fresh decoder state per utterance; one URL and one prepared-PCM warmup; five measured URL/PCM pairs in alternating order.",
+  "model" : "Parakeet TDT 0.6B v3",
+  "operatingSystem" : "Version 26.2 (Build 25C56)",
+  "order" : [
+    "url",
+    "prepared_pcm",
+    "url",
+    "prepared_pcm",
+    "url",
+    "prepared_pcm",
+    "url",
+    "prepared_pcm",
+    "url",
+    "prepared_pcm"
+  ],
+  "physicalMemoryBytes" : 17179869184,
+  "preparedPCM" : {
+    "maximumSeconds" : 0.28907425,
+    "medianSeconds" : 0.2867695,
+    "minimumSeconds" : 0.2836595,
+    "rangeSeconds" : 0.005414749999999968,
+    "rawSeconds" : [
+      0.2836595,
+      0.28907425,
+      0.288305375,
+      0.2867695,
+      0.283745875
+    ],
+    "realTimeFactor" : 0.002953159434020555,
+    "varianceSecondsSquared" : 5.086724583749967e-06
+  },
+  "url" : {
+    "maximumSeconds" : 0.304619375,
+    "medianSeconds" : 0.300241833,
+    "minimumSeconds" : 0.296741208,
+    "rangeSeconds" : 0.007878167000000047,
+    "rawSeconds" : [
+      0.300241833,
+      0.303004042,
+      0.296741208,
+      0.304619375,
+      0.299840166
+    ],
+    "realTimeFactor" : 0.0030918978538916238,
+    "varianceSecondsSquared" : 7.4224312271245996e-06
+  },
+  "urlToPCMSpeedup" : 1.0469796578785402,
+  "warmupsPerRoute" : 1
+}
