@@ -10,6 +10,10 @@ enum RecordingStatus: String, Codable {
     case deleting
 }
 
+enum QueueArtifactState: String, Codable {
+    case staging
+}
+
 struct Recording: Identifiable, Codable, FetchableRecord, PersistableRecord, Equatable {
     let id: UUID
     let timestamp: Date
@@ -20,12 +24,13 @@ struct Recording: Identifiable, Codable, FetchableRecord, PersistableRecord, Equ
     var progress: Float
     var sourceFileURL: String?
     var preparedPCMFileURL: String? = nil
+    var queueArtifactState: QueueArtifactState? = nil
     
     var isRegeneration: Bool = false
     
     enum CodingKeys: String, CodingKey {
         case id, timestamp, fileName, transcription, duration, status, progress, sourceFileURL,
-             preparedPCMFileURL
+             preparedPCMFileURL, queueArtifactState
     }
 
     static func == (lhs: Recording, rhs: Recording) -> Bool {
@@ -73,7 +78,15 @@ struct Recording: Identifiable, Codable, FetchableRecord, PersistableRecord, Equ
         static let progress = Column(CodingKeys.progress)
         static let sourceFileURL = Column(CodingKeys.sourceFileURL)
         static let preparedPCMFileURL = Column(CodingKeys.preparedPCMFileURL)
+        static let queueArtifactState = Column(CodingKeys.queueArtifactState)
     }
+}
+
+enum QueueArtifactCheckpoint: CaseIterable {
+    case beforeSourceMove
+    case afterSourceMove
+    case afterPreparedPCMWrite
+    case afterActivation
 }
 
 @MainActor
@@ -84,7 +97,7 @@ class RecordingStore: ObservableObject {
     private let dbQueue: DatabaseQueue?
     private let initializationError: Error?
     private let reconcilesOrphanedArtifacts: Bool
-    private var stagingQueueArtifactIDs: Set<UUID> = []
+    private let queueArtifactCheckpoint: ((QueueArtifactCheckpoint, Recording) throws -> Void)?
 
     private convenience init() {
         let directory = Recording.recordingsDirectory.deletingLastPathComponent()
@@ -94,8 +107,13 @@ class RecordingStore: ObservableObject {
         )
     }
 
-    init(databaseURL: URL, reconcilesOrphanedArtifacts: Bool = false) {
+    init(
+        databaseURL: URL,
+        reconcilesOrphanedArtifacts: Bool = false,
+        queueArtifactCheckpoint: ((QueueArtifactCheckpoint, Recording) throws -> Void)? = nil
+    ) {
         self.reconcilesOrphanedArtifacts = reconcilesOrphanedArtifacts
+        self.queueArtifactCheckpoint = queueArtifactCheckpoint
         do {
             try FileManager.default.createDirectory(at: databaseURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let database = try DatabaseQueue(path: databaseURL.path)
@@ -109,8 +127,12 @@ class RecordingStore: ObservableObject {
         }
     }
 
-    init(databaseQueue: DatabaseQueue) throws {
+    init(
+        databaseQueue: DatabaseQueue,
+        queueArtifactCheckpoint: ((QueueArtifactCheckpoint, Recording) throws -> Void)? = nil
+    ) throws {
         reconcilesOrphanedArtifacts = false
+        self.queueArtifactCheckpoint = queueArtifactCheckpoint
         try Self.setupDatabase(databaseQueue)
         dbQueue = databaseQueue
         initializationError = nil
@@ -164,6 +186,15 @@ class RecordingStore: ObservableObject {
                 }
             }
         }
+
+        migrator.registerMigration("v4_add_queue_artifact_state") { db in
+            let columns = try db.columns(in: Recording.databaseTableName)
+            if !columns.contains(where: { $0.name == "queueArtifactState" }) {
+                try db.alter(table: Recording.databaseTableName) { table in
+                    table.add(column: "queueArtifactState", .text)
+                }
+            }
+        }
         
         try migrator.migrate(dbQueue)
     }
@@ -208,83 +239,60 @@ class RecordingStore: ObservableObject {
 
     func addQueuedRecording(url: URL, duration: TimeInterval, pcmSamples: [Float]?) async throws {
         let id = UUID()
-        stagingQueueArtifactIDs.insert(id)
-        defer { stagingQueueArtifactIDs.remove(id) }
         let fileName = Recording.fileName(for: id)
-        let preparedPCMURL = pcmSamples.map { _ in QueuedPCMFile.url(for: id) }
-        let durableSourceURL = pcmSamples.map {
-            _ in Recording.recordingsDirectory.appendingPathComponent(fileName)
+        guard let pcmSamples else {
+            let recording = Recording(
+                id: id,
+                timestamp: Date(),
+                fileName: fileName,
+                transcription: "",
+                duration: duration,
+                status: .pending,
+                progress: 0,
+                sourceFileURL: url.path
+            )
+            try await addRecordingSync(recording)
+            return
         }
 
-        if let pcmSamples, let preparedPCMURL {
-            try await Task.detached(priority: .userInitiated) {
-                try QueuedPCMFile.write(pcmSamples, to: preparedPCMURL)
-            }.value
-        }
-
-        if let durableSourceURL, url.standardizedFileURL != durableSourceURL.standardizedFileURL {
-            do {
-                try await Task.detached(priority: .userInitiated) {
-                    try FileManager.default.createDirectory(
-                        at: durableSourceURL.deletingLastPathComponent(),
-                        withIntermediateDirectories: true
-                    )
-                    try FileManager.default.moveItem(at: url, to: durableSourceURL)
-                }.value
-            } catch {
-                if let preparedPCMURL {
-                    try? FileManager.default.removeItem(at: preparedPCMURL)
-                }
-                throw error
-            }
-        }
-
-        let recording = Recording(
+        let preparedPCMURL = QueuedPCMFile.url(for: id)
+        let durableSourceURL = Recording.recordingsDirectory.appendingPathComponent(fileName)
+        var recording = Recording(
             id: id,
             timestamp: Date(),
             fileName: fileName,
             transcription: "",
             duration: duration,
-            status: .pending,
+            status: .failed,
             progress: 0,
-            sourceFileURL: (durableSourceURL ?? url).path,
-            preparedPCMFileURL: preparedPCMURL?.path
+            sourceFileURL: url.path,
+            preparedPCMFileURL: preparedPCMURL.path,
+            queueArtifactState: .staging
         )
-
-        do {
-            try await addRecordingSync(recording)
-        } catch {
-            if let preparedPCMURL {
-                try? FileManager.default.removeItem(at: preparedPCMURL)
-            }
-            if let durableSourceURL {
-                throw PreservedAudioError(url: durableSourceURL, underlying: error)
-            }
-            throw error
+        try await insertRecording(recording)
+        try queueArtifactCheckpoint?(.beforeSourceMove, recording)
+        if url.standardizedFileURL != durableSourceURL.standardizedFileURL {
+            try await moveQueueSource(from: url, to: durableSourceURL)
         }
+        try queueArtifactCheckpoint?(.afterSourceMove, recording)
+        try await Task.detached(priority: .userInitiated) {
+            try QueuedPCMFile.write(pcmSamples, to: preparedPCMURL)
+        }.value
+        try queueArtifactCheckpoint?(.afterPreparedPCMWrite, recording)
+        recording.sourceFileURL = durableSourceURL.path
+        recording.status = .pending
+        recording.queueArtifactState = nil
+        try await activateStagedRecording(recording)
+        try queueArtifactCheckpoint?(.afterActivation, recording)
     }
 
     func saveFailedDictation(_ audio: RecordedAudio, error: Error) async throws -> Recording {
         let id = UUID()
-        stagingQueueArtifactIDs.insert(id)
-        defer { stagingQueueArtifactIDs.remove(id) }
         let alreadySaved = audio.url.deletingLastPathComponent().standardizedFileURL == Recording.recordingsDirectory.standardizedFileURL
         let name = alreadySaved ? audio.url.lastPathComponent : Recording.fileName(for: id)
         let destination = Recording.recordingsDirectory.appendingPathComponent(name)
         let preparedPCMURL = QueuedPCMFile.url(for: id)
-        do {
-            try QueuedPCMFile.write(audio.samples, to: preparedPCMURL)
-            if !alreadySaved {
-                try AudioRecorder.shared.moveTemporaryRecording(from: audio.url, to: destination)
-            }
-        } catch {
-            try? FileManager.default.removeItem(at: preparedPCMURL)
-            let preservedURL = FileManager.default.fileExists(atPath: destination.path)
-                ? destination
-                : audio.url
-            throw PreservedAudioError(url: preservedURL, underlying: error)
-        }
-        let row = Recording(
+        var row = Recording(
             id: id,
             timestamp: Date(),
             fileName: name,
@@ -292,14 +300,33 @@ class RecordingStore: ObservableObject {
             duration: audio.duration,
             status: .failed,
             progress: 0,
-            sourceFileURL: destination.path,
-            preparedPCMFileURL: preparedPCMURL.path
+            sourceFileURL: audio.url.path,
+            preparedPCMFileURL: preparedPCMURL.path,
+            queueArtifactState: .staging
         )
         do {
-            try await addRecordingSync(row)
+            try await insertRecording(row)
         } catch {
-            try? FileManager.default.removeItem(at: preparedPCMURL)
-            throw PreservedAudioError(url: destination, underlying: error)
+            throw PreservedAudioError(url: audio.url, underlying: error)
+        }
+        do {
+            try queueArtifactCheckpoint?(.beforeSourceMove, row)
+            if !alreadySaved {
+                try AudioRecorder.shared.moveTemporaryRecording(from: audio.url, to: destination)
+            }
+            try queueArtifactCheckpoint?(.afterSourceMove, row)
+            try QueuedPCMFile.write(audio.samples, to: preparedPCMURL)
+            try queueArtifactCheckpoint?(.afterPreparedPCMWrite, row)
+            row.sourceFileURL = destination.path
+            row.status = .failed
+            row.queueArtifactState = nil
+            try await activateStagedRecording(row)
+            try queueArtifactCheckpoint?(.afterActivation, row)
+        } catch {
+            let preservedURL = FileManager.default.fileExists(atPath: destination.path)
+                ? destination
+                : audio.url
+            throw PreservedAudioError(url: preservedURL, underlying: error)
         }
         return row
     }
@@ -338,6 +365,34 @@ class RecordingStore: ObservableObject {
         try await database().write { db in
             try recording.insert(db)
         }
+    }
+
+    private func moveQueueSource(from source: URL, to destination: URL) async throws {
+        try await Task.detached(priority: .userInitiated) {
+            try FileManager.default.createDirectory(
+                at: destination.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try FileManager.default.moveItem(at: source, to: destination)
+        }.value
+    }
+
+    private func activateStagedRecording(_ recording: Recording) async throws {
+        let updated = try await database().write { db in
+            try Recording
+                .filter(Recording.Columns.id == recording.id)
+                .filter(Recording.Columns.queueArtifactState == QueueArtifactState.staging.rawValue)
+                .updateAll(db, [
+                    Recording.Columns.transcription.set(to: recording.transcription),
+                    Recording.Columns.status.set(to: recording.status.rawValue),
+                    Recording.Columns.progress.set(to: recording.progress),
+                    Recording.Columns.sourceFileURL.set(to: recording.sourceFileURL),
+                    Recording.Columns.preparedPCMFileURL.set(to: recording.preparedPCMFileURL),
+                    Recording.Columns.queueArtifactState.set(to: nil as String?)
+                ])
+        }
+        guard updated == 1 else { throw TranscriptionError.processingFailed }
+        NotificationCenter.default.post(name: Self.recordingsDidUpdateNotification, object: nil)
     }
     
     func updateRecording(_ recording: Recording) {
@@ -458,11 +513,72 @@ class RecordingStore: ObservableObject {
     }
 
     func reconcileQueueArtifactLifecycle() async throws {
+        try await recoverStagedQueueArtifacts()
         try await retryCompletedPreparedPCMCleanup()
         try await retryDeletingRecordings()
         if reconcilesOrphanedArtifacts {
             try await reconcileOrphanedQueueArtifacts()
         }
+    }
+
+    func recoverStagedQueueArtifacts() async throws {
+        let staged = try await database().read { db in
+            try Recording
+                .filter(Recording.Columns.queueArtifactState == QueueArtifactState.staging.rawValue)
+                .order(Recording.Columns.timestamp.asc)
+                .fetchAll(db)
+        }
+        var firstError: Error?
+        for recording in staged {
+            do {
+                try await recoverStagedQueueArtifact(recording)
+            } catch {
+                if firstError == nil { firstError = error }
+            }
+        }
+        if let firstError { throw firstError }
+    }
+
+    private func recoverStagedQueueArtifact(_ recording: Recording) async throws {
+        let fileManager = FileManager.default
+        let durableSourceURL = recording.url
+        if !fileManager.fileExists(atPath: durableSourceURL.path),
+           let sourcePath = recording.sourceFileURL {
+            let sourceURL = URL(fileURLWithPath: sourcePath)
+            if fileManager.fileExists(atPath: sourceURL.path),
+               sourceURL.standardizedFileURL != durableSourceURL.standardizedFileURL {
+                try await moveQueueSource(from: sourceURL, to: durableSourceURL)
+            }
+        }
+
+        guard fileManager.fileExists(atPath: durableSourceURL.path) else {
+            if let path = recording.preparedPCMFileURL,
+               fileManager.fileExists(atPath: path) {
+                try fileManager.removeItem(atPath: path)
+            }
+            try await database().write { db in
+                _ = try Recording
+                    .filter(Recording.Columns.id == recording.id)
+                    .filter(Recording.Columns.queueArtifactState == QueueArtifactState.staging.rawValue)
+                    .deleteAll(db)
+            }
+            return
+        }
+
+        var recovered = recording
+        recovered.sourceFileURL = durableSourceURL.path
+        if let preparedPath = recording.preparedPCMFileURL,
+           fileManager.fileExists(atPath: preparedPath) {
+            recovered.transcription = ""
+            recovered.status = .pending
+        } else {
+            recovered.transcription = recording.transcription.isEmpty
+                ? "Prepared audio could not be recovered."
+                : recording.transcription
+            recovered.status = .failed
+            recovered.preparedPCMFileURL = nil
+        }
+        try await activateStagedRecording(recovered)
     }
 
     nonisolated func updateSourceFileURL(_ id: UUID, sourceURL: String) async throws {
@@ -562,6 +678,7 @@ class RecordingStore: ObservableObject {
             let request = Recording
                 .filter(Recording.Columns.timestamp < cutoff)
                 .filter(!Self.pendingStatuses.contains(Recording.Columns.status))
+                .filter(Recording.Columns.queueArtifactState == nil)
                 .filter(Recording.Columns.status != RecordingStatus.deleting.rawValue)
             let count = try request.fetchCount(db)
             let oldest = try request
@@ -578,6 +695,7 @@ class RecordingStore: ObservableObject {
             try Recording
                 .filter(Recording.Columns.timestamp < cutoff)
                 .filter(!Self.pendingStatuses.contains(Recording.Columns.status))
+                .filter(Recording.Columns.queueArtifactState == nil)
                 .filter(Recording.Columns.status != RecordingStatus.deleting.rawValue)
                 .fetchAll(db)
         }
@@ -673,8 +791,7 @@ class RecordingStore: ObservableObject {
     }
 
     func reconcileOrphanedQueueArtifacts(
-        artifactDirectory: URL = QueuedPCMFile.directory,
-        recordingsDirectory: URL = Recording.recordingsDirectory
+        artifactDirectory: URL = QueuedPCMFile.directory
     ) async throws {
         let referencedPaths = Set(try await database().read { db in
             try Recording
@@ -690,17 +807,6 @@ class RecordingStore: ObservableObject {
         for artifact in artifacts {
             let standardized = artifact.standardizedFileURL
             if referencedPaths.contains(standardized.path) { continue }
-            if stagingQueueArtifactIDs.contains(where: {
-                artifact.lastPathComponent.contains($0.uuidString)
-            }) { continue }
-            if artifact.pathExtension == "wav",
-               let id = UUID(uuidString: artifact.deletingPathExtension().lastPathComponent) {
-                let sourceURL = recordingsDirectory
-                    .appendingPathComponent(Recording.fileName(for: id))
-                if FileManager.default.fileExists(atPath: sourceURL.path) {
-                    try FileManager.default.removeItem(at: sourceURL)
-                }
-            }
             try FileManager.default.removeItem(at: artifact)
         }
     }

@@ -46,9 +46,6 @@ class AudioRecorder: NSObject, ObservableObject {
         
         super.init()
         createTemporaryDirectoryIfNeeded()
-        workQueue.async { [temporaryDirectory] in
-            Self.cleanupOldTemporaryFiles(in: temporaryDirectory, olderThan: Self.temporaryFileMaxAge)
-        }
         setup()
     }
     

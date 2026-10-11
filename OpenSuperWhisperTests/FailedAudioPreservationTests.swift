@@ -46,6 +46,114 @@ final class FailedAudioPreservationTests: XCTestCase {
         }
     }
 
+    func testStagedArtifactInterruptionRecoveryMatrix() async throws {
+        enum Origin: CaseIterable {
+            case queued
+            case directFailure
+        }
+        struct SimulatedInterruption: Error {}
+
+        let samples: [Float] = [0.25, -0.5, 0.75]
+        let sourceBytes = Data([9, 8, 7, 6])
+
+        for origin in Origin.allCases {
+            for checkpoint in QueueArtifactCheckpoint.allCases {
+                let databaseDirectory = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("staged-artifact-\(UUID())", isDirectory: true)
+                let databaseURL = databaseDirectory.appendingPathComponent("recordings.sqlite")
+                let sourceURL = databaseDirectory
+                    .appendingPathComponent("staged-source-\(UUID()).wav")
+                try FileManager.default.createDirectory(
+                    at: databaseDirectory,
+                    withIntermediateDirectories: true
+                )
+                try sourceBytes.write(to: sourceURL)
+                try FileManager.default.setAttributes(
+                    [.modificationDate: Date(timeIntervalSinceNow: -(AudioRecorder.temporaryFileMaxAge + 60))],
+                    ofItemAtPath: sourceURL.path
+                )
+                defer {
+                    try? FileManager.default.removeItem(at: databaseDirectory)
+                    try? FileManager.default.removeItem(at: sourceURL)
+                }
+
+                let interruptedStore = RecordingStore(
+                    databaseURL: databaseURL,
+                    queueArtifactCheckpoint: { reached, _ in
+                        if reached == checkpoint { throw SimulatedInterruption() }
+                    }
+                )
+                do {
+                    switch origin {
+                    case .queued:
+                        try await interruptedStore.addQueuedRecording(
+                            url: sourceURL,
+                            duration: Double(samples.count) / 16000,
+                            pcmSamples: samples
+                        )
+                    case .directFailure:
+                        _ = try await interruptedStore.saveFailedDictation(
+                            RecordedAudio(url: sourceURL, samples: samples),
+                            error: TranscriptionError.processingFailed
+                        )
+                    }
+                    XCTFail("Expected interruption at \(checkpoint)")
+                } catch {}
+
+                let interruptedRows = try await interruptedStore.fetchRecordings(limit: 1, offset: 0)
+                let interrupted = try XCTUnwrap(interruptedRows.first)
+                let preparedURL = URL(fileURLWithPath: try XCTUnwrap(interrupted.preparedPCMFileURL))
+                defer {
+                    try? FileManager.default.removeItem(at: interrupted.url)
+                    try? FileManager.default.removeItem(at: preparedURL)
+                }
+                if checkpoint == .beforeSourceMove {
+                    XCTAssertTrue(FileManager.default.fileExists(atPath: sourceURL.path), "\(origin) \(checkpoint)")
+                } else {
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: sourceURL.path), "\(origin) \(checkpoint)")
+                    XCTAssertTrue(FileManager.default.fileExists(atPath: interrupted.url.path), "\(origin) \(checkpoint)")
+                }
+                let expectedInterruptedState: QueueArtifactState? = checkpoint == .afterActivation ? nil : .staging
+                XCTAssertEqual(interrupted.queueArtifactState, expectedInterruptedState, "\(origin) \(checkpoint)")
+
+                let recoveredStore = RecordingStore(databaseURL: databaseURL)
+                try await recoveredStore.reconcileQueueArtifactLifecycle()
+                AudioRecorder.cleanupOldTemporaryFiles(
+                    in: sourceURL.deletingLastPathComponent(),
+                    olderThan: AudioRecorder.temporaryFileMaxAge
+                )
+                let recoveredRows = try await recoveredStore.fetchRecordings(limit: 1, offset: 0)
+                let recovered = try XCTUnwrap(recoveredRows.first)
+
+                let expectedStatus: RecordingStatus
+                switch checkpoint {
+                case .beforeSourceMove, .afterSourceMove:
+                    expectedStatus = .failed
+                case .afterPreparedPCMWrite:
+                    expectedStatus = .pending
+                case .afterActivation:
+                    expectedStatus = origin == .queued ? .pending : .failed
+                }
+                XCTAssertEqual(recovered.status, expectedStatus, "\(origin) \(checkpoint)")
+                XCTAssertNil(recovered.queueArtifactState, "\(origin) \(checkpoint)")
+                XCTAssertEqual(recovered.sourceFileURL, recovered.url.path, "\(origin) \(checkpoint)")
+                XCTAssertEqual(try Data(contentsOf: recovered.url), sourceBytes, "\(origin) \(checkpoint)")
+                XCTAssertFalse(FileManager.default.fileExists(atPath: sourceURL.path), "\(origin) \(checkpoint)")
+
+                let shouldHavePreparedPCM = checkpoint == .afterPreparedPCMWrite || checkpoint == .afterActivation
+                if shouldHavePreparedPCM {
+                    XCTAssertEqual(recovered.preparedPCMFileURL, preparedURL.path, "\(origin) \(checkpoint)")
+                    XCTAssertEqual(try QueuedPCMFile.read(from: preparedURL), samples, "\(origin) \(checkpoint)")
+                } else {
+                    XCTAssertNil(recovered.preparedPCMFileURL, "\(origin) \(checkpoint)")
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: preparedURL.path), "\(origin) \(checkpoint)")
+                }
+
+                try await recoveredStore.deleteRecordingSync(recovered, cancelTranscription: false)
+            }
+        }
+    }
+
     func testClosingFailedPCMWriterPreservesAlreadyWrittenFrames() throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".wav")
         defer { try? FileManager.default.removeItem(at: url) }
@@ -216,13 +324,10 @@ final class FailedAudioPreservationTests: XCTestCase {
         )
         try await store.addRecordingSync(referenced)
 
-        try await store.reconcileOrphanedQueueArtifacts(
-            artifactDirectory: artifactDirectory,
-            recordingsDirectory: directory
-        )
+        try await store.reconcileOrphanedQueueArtifacts(artifactDirectory: artifactDirectory)
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: orphanArtifact.path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: orphanSource.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: orphanSource.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: interruptedWrite.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: referencedArtifact.path))
     }

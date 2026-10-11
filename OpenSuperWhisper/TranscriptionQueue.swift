@@ -76,6 +76,10 @@ class TranscriptionQueue: ObservableObject {
         processingTask = Task {
             do {
                 try await recordingStore.reconcileQueueArtifactLifecycle()
+                AudioRecorder.cleanupOldTemporaryFiles(
+                    in: AudioRecorder.temporaryRecordingsDirectory,
+                    olderThan: AudioRecorder.temporaryFileMaxAge
+                )
                 try await cleanupMissingFiles()
                 try await processQueue()
             } catch is CancellationError {
