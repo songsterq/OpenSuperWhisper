@@ -53,8 +53,7 @@ final class FailedAudioPreservationTests: XCTestCase {
         }
         struct SimulatedInterruption: Error {}
 
-        let samples: [Float] = [0.25, -0.5, 0.75]
-        let sourceBytes = Data([9, 8, 7, 6])
+        let inputSamples = (0..<2048).map { $0.isMultiple(of: 2) ? Float(0.25) : Float(-0.5) }
 
         for origin in Origin.allCases {
             for checkpoint in QueueArtifactCheckpoint.allCases {
@@ -67,7 +66,40 @@ final class FailedAudioPreservationTests: XCTestCase {
                     at: databaseDirectory,
                     withIntermediateDirectories: true
                 )
-                try sourceBytes.write(to: sourceURL)
+                let layout = try XCTUnwrap(AVAudioChannelLayout(
+                    layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | 4
+                ))
+                let format = try XCTUnwrap(AVAudioFormat(
+                    commonFormat: .pcmFormatFloat32,
+                    sampleRate: 16000,
+                    interleaved: false,
+                    channelLayout: layout
+                ))
+                let writer = try PCMRecordingWriter(url: sourceURL, inputFormat: format)
+                let buffer = try XCTUnwrap(AVAudioPCMBuffer(
+                    pcmFormat: format,
+                    frameCapacity: AVAudioFrameCount(inputSamples.count)
+                ))
+                buffer.frameLength = AVAudioFrameCount(inputSamples.count)
+                for channel in 0..<4 {
+                    if channel == 0 {
+                        inputSamples.withUnsafeBufferPointer {
+                            buffer.floatChannelData![channel].update(
+                                from: $0.baseAddress!,
+                                count: inputSamples.count
+                            )
+                        }
+                    } else {
+                        buffer.floatChannelData![channel].initialize(
+                            repeating: 0,
+                            count: inputSamples.count
+                        )
+                    }
+                }
+                try writer.append(buffer)
+                let recorded = try writer.finish()
+                let samples = recorded.samples
+                let sourceBytes = try Data(contentsOf: sourceURL)
                 try FileManager.default.setAttributes(
                     [.modificationDate: Date(timeIntervalSinceNow: -(AudioRecorder.temporaryFileMaxAge + 60))],
                     ofItemAtPath: sourceURL.path
@@ -77,10 +109,17 @@ final class FailedAudioPreservationTests: XCTestCase {
                     try? FileManager.default.removeItem(at: sourceURL)
                 }
 
+                let checkpointLock = NSLock()
+                var interruptionObserved = false
                 let interruptedStore = RecordingStore(
                     databaseURL: databaseURL,
                     queueArtifactCheckpoint: { reached, _ in
-                        if reached == checkpoint { throw SimulatedInterruption() }
+                        if reached == checkpoint {
+                            checkpointLock.lock()
+                            interruptionObserved = true
+                            checkpointLock.unlock()
+                            throw SimulatedInterruption()
+                        }
                     }
                 )
                 do {
@@ -88,7 +127,7 @@ final class FailedAudioPreservationTests: XCTestCase {
                     case .queued:
                         try await interruptedStore.addQueuedRecording(
                             url: sourceURL,
-                            duration: Double(samples.count) / 16000,
+                            duration: recorded.duration,
                             pcmSamples: samples
                         )
                     case .directFailure:
@@ -99,6 +138,10 @@ final class FailedAudioPreservationTests: XCTestCase {
                     }
                     XCTFail("Expected interruption at \(checkpoint)")
                 } catch {}
+                checkpointLock.lock()
+                let didInterrupt = interruptionObserved
+                checkpointLock.unlock()
+                XCTAssertTrue(didInterrupt, "\(origin) \(checkpoint)")
 
                 let interruptedRows = try await interruptedStore.fetchRecordings(limit: 1, offset: 0)
                 let interrupted = try XCTUnwrap(interruptedRows.first)
@@ -127,9 +170,8 @@ final class FailedAudioPreservationTests: XCTestCase {
 
                 let expectedStatus: RecordingStatus
                 switch checkpoint {
-                case .beforeSourceMove, .afterSourceMove:
-                    expectedStatus = .failed
-                case .afterPreparedPCMWrite:
+                case .beforeSourceMove, .afterSourceMove, .duringPreparedPCMWrite,
+                     .afterPreparedPCMWrite:
                     expectedStatus = .pending
                 case .afterActivation:
                     expectedStatus = origin == .queued ? .pending : .failed
@@ -140,18 +182,60 @@ final class FailedAudioPreservationTests: XCTestCase {
                 XCTAssertEqual(try Data(contentsOf: recovered.url), sourceBytes, "\(origin) \(checkpoint)")
                 XCTAssertFalse(FileManager.default.fileExists(atPath: sourceURL.path), "\(origin) \(checkpoint)")
 
-                let shouldHavePreparedPCM = checkpoint == .afterPreparedPCMWrite || checkpoint == .afterActivation
-                if shouldHavePreparedPCM {
-                    XCTAssertEqual(recovered.preparedPCMFileURL, preparedURL.path, "\(origin) \(checkpoint)")
-                    XCTAssertEqual(try QueuedPCMFile.read(from: preparedURL), samples, "\(origin) \(checkpoint)")
-                } else {
-                    XCTAssertNil(recovered.preparedPCMFileURL, "\(origin) \(checkpoint)")
-                    XCTAssertFalse(FileManager.default.fileExists(atPath: preparedURL.path), "\(origin) \(checkpoint)")
-                }
+                XCTAssertEqual(recovered.preparedPCMFileURL, preparedURL.path, "\(origin) \(checkpoint)")
+                XCTAssertEqual(try QueuedPCMFile.read(from: preparedURL), samples, "\(origin) \(checkpoint)")
 
                 try await recoveredStore.deleteRecordingSync(recovered, cancelTranscription: false)
             }
         }
+    }
+
+    func testQueuedPCMWriteBufferRemainsBoundedAcrossChunks() throws {
+        let sampleCount = QueuedPCMFile.maximumWriteBufferFrames * 3 + 17
+        let samples = (0..<sampleCount).map { Float($0 % 101) / 101 }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("bounded-pcm-\(UUID()).wav")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let metrics = try QueuedPCMFile.write(samples, to: url)
+
+        XCTAssertEqual(metrics.chunkCount, 4)
+        XCTAssertEqual(metrics.maximumBufferFrames, QueuedPCMFile.maximumWriteBufferFrames)
+        XCTAssertEqual(try QueuedPCMFile.read(from: url), samples)
+    }
+
+    func testFailedDictationPCMWriteRunsOffMainActor() async throws {
+        let source = FileManager.default.temporaryDirectory
+            .appendingPathComponent("failed-write-thread-\(UUID()).wav")
+        try Data([1, 2, 3]).write(to: source)
+        defer { try? FileManager.default.removeItem(at: source) }
+        let lock = NSLock()
+        var writeRanOnMainThread: Bool?
+        let store = try RecordingStore(
+            databaseQueue: DatabaseQueue(),
+            queueArtifactCheckpoint: { checkpoint, _ in
+                guard checkpoint == .duringPreparedPCMWrite else { return }
+                lock.lock()
+                writeRanOnMainThread = Thread.isMainThread
+                lock.unlock()
+            }
+        )
+
+        let row = try await store.saveFailedDictation(
+            RecordedAudio(url: source, samples: [Float](repeating: 0.25, count: 2048)),
+            error: TranscriptionError.processingFailed
+        )
+        let preparedURL = URL(fileURLWithPath: try XCTUnwrap(row.preparedPCMFileURL))
+        defer {
+            try? FileManager.default.removeItem(at: row.url)
+            try? FileManager.default.removeItem(at: preparedURL)
+        }
+        lock.lock()
+        let observed = writeRanOnMainThread
+        lock.unlock()
+
+        XCTAssertEqual(observed, false)
+        XCTAssertEqual(try QueuedPCMFile.read(from: preparedURL).count, 2048)
     }
 
     func testClosingFailedPCMWriterPreservesAlreadyWrittenFrames() throws {

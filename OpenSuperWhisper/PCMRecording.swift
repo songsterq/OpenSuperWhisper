@@ -14,6 +14,13 @@ struct RecordingCaptureError: Error {
 }
 
 enum QueuedPCMFile {
+    struct WriteMetrics: Equatable {
+        let chunkCount: Int
+        let maximumBufferFrames: Int
+    }
+
+    static let maximumWriteBufferFrames = 65_536
+
     static var directory: URL {
         Recording.recordingsDirectory.appendingPathComponent("prepared-pcm", isDirectory: true)
     }
@@ -26,7 +33,12 @@ enum QueuedPCMFile {
         sourceURL.appendingPathExtension("prepared.wav")
     }
 
-    static func write(_ samples: [Float], to url: URL) throws {
+    @discardableResult
+    static func write(
+        _ samples: [Float],
+        to url: URL,
+        afterChunk: ((Int) throws -> Void)? = nil
+    ) throws -> WriteMetrics {
         guard samples.count <= Int(UInt32.max) else {
             throw TranscriptionError.audioConversionFailed
         }
@@ -35,17 +47,8 @@ enum QueuedPCMFile {
             sampleRate: 16000,
             channels: 1,
             interleaved: false
-        ), let buffer = AVAudioPCMBuffer(
-            pcmFormat: format,
-            frameCapacity: AVAudioFrameCount(max(samples.count, 1))
         ) else {
             throw TranscriptionError.audioConversionFailed
-        }
-
-        buffer.frameLength = AVAudioFrameCount(samples.count)
-        samples.withUnsafeBufferPointer { source in
-            guard let baseAddress = source.baseAddress else { return }
-            buffer.floatChannelData![0].update(from: baseAddress, count: samples.count)
         }
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
@@ -60,11 +63,37 @@ enum QueuedPCMFile {
             commonFormat: .pcmFormatFloat32,
             interleaved: false
         )
-        try file.write(from: buffer)
+        let bufferCapacity = min(max(samples.count, 1), maximumWriteBufferFrames)
+        guard let buffer = AVAudioPCMBuffer(
+            pcmFormat: format,
+            frameCapacity: AVAudioFrameCount(bufferCapacity)
+        ) else {
+            throw TranscriptionError.audioConversionFailed
+        }
+        var chunkCount = 0
+        var maximumBufferFrames = 0
+        for offset in stride(from: 0, to: samples.count, by: maximumWriteBufferFrames) {
+            let count = min(maximumWriteBufferFrames, samples.count - offset)
+            buffer.frameLength = AVAudioFrameCount(count)
+            samples.withUnsafeBufferPointer { source in
+                buffer.floatChannelData![0].update(
+                    from: source.baseAddress! + offset,
+                    count: count
+                )
+            }
+            try file.write(from: buffer)
+            chunkCount += 1
+            maximumBufferFrames = max(maximumBufferFrames, count)
+            try afterChunk?(chunkCount)
+        }
         if FileManager.default.fileExists(atPath: url.path) {
             try FileManager.default.removeItem(at: url)
         }
         try FileManager.default.moveItem(at: temporaryURL, to: url)
+        return WriteMetrics(
+            chunkCount: chunkCount,
+            maximumBufferFrames: maximumBufferFrames
+        )
     }
 
     static func read(from url: URL) throws -> [Float] {

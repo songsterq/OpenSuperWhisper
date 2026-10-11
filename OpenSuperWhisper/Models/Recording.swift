@@ -85,6 +85,7 @@ struct Recording: Identifiable, Codable, FetchableRecord, PersistableRecord, Equ
 enum QueueArtifactCheckpoint: CaseIterable {
     case beforeSourceMove
     case afterSourceMove
+    case duringPreparedPCMWrite
     case afterPreparedPCMWrite
     case afterActivation
 }
@@ -275,9 +276,7 @@ class RecordingStore: ObservableObject {
             try await moveQueueSource(from: url, to: durableSourceURL)
         }
         try queueArtifactCheckpoint?(.afterSourceMove, recording)
-        try await Task.detached(priority: .userInitiated) {
-            try QueuedPCMFile.write(pcmSamples, to: preparedPCMURL)
-        }.value
+        try await writePreparedPCM(pcmSamples, to: preparedPCMURL, for: recording)
         try queueArtifactCheckpoint?(.afterPreparedPCMWrite, recording)
         recording.sourceFileURL = durableSourceURL.path
         recording.status = .pending
@@ -312,10 +311,10 @@ class RecordingStore: ObservableObject {
         do {
             try queueArtifactCheckpoint?(.beforeSourceMove, row)
             if !alreadySaved {
-                try AudioRecorder.shared.moveTemporaryRecording(from: audio.url, to: destination)
+                try await moveQueueSource(from: audio.url, to: destination)
             }
             try queueArtifactCheckpoint?(.afterSourceMove, row)
-            try QueuedPCMFile.write(audio.samples, to: preparedPCMURL)
+            try await writePreparedPCM(audio.samples, to: preparedPCMURL, for: row)
             try queueArtifactCheckpoint?(.afterPreparedPCMWrite, row)
             row.sourceFileURL = destination.path
             row.status = .failed
@@ -374,6 +373,19 @@ class RecordingStore: ObservableObject {
                 withIntermediateDirectories: true
             )
             try FileManager.default.moveItem(at: source, to: destination)
+        }.value
+    }
+
+    private func writePreparedPCM(
+        _ samples: [Float],
+        to destination: URL,
+        for recording: Recording
+    ) async throws {
+        let checkpoint = queueArtifactCheckpoint
+        try await Task.detached(priority: .userInitiated) {
+            try QueuedPCMFile.write(samples, to: destination) { _ in
+                try checkpoint?(.duringPreparedPCMWrite, recording)
+            }
         }.value
     }
 
@@ -567,17 +579,17 @@ class RecordingStore: ObservableObject {
 
         var recovered = recording
         recovered.sourceFileURL = durableSourceURL.path
-        if let preparedPath = recording.preparedPCMFileURL,
-           fileManager.fileExists(atPath: preparedPath) {
-            recovered.transcription = ""
-            recovered.status = .pending
-        } else {
-            recovered.transcription = recording.transcription.isEmpty
-                ? "Prepared audio could not be recovered."
-                : recording.transcription
-            recovered.status = .failed
-            recovered.preparedPCMFileURL = nil
+        let preparedURL = recording.preparedPCMFileURL.map { URL(fileURLWithPath: $0) }
+            ?? QueuedPCMFile.url(for: recording.id)
+        if !fileManager.fileExists(atPath: preparedURL.path) {
+            guard let samples = try await WhisperEngine().convertAudioToPCM(fileURL: durableSourceURL) else {
+                throw TranscriptionError.audioConversionFailed
+            }
+            try await writePreparedPCM(samples, to: preparedURL, for: recording)
         }
+        recovered.transcription = ""
+        recovered.status = .pending
+        recovered.preparedPCMFileURL = preparedURL.path
         try await activateStagedRecording(recovered)
     }
 
