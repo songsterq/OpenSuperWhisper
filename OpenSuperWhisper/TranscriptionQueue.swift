@@ -175,14 +175,10 @@ class TranscriptionQueue: ObservableObject {
             return
         }
 
-        try await recordingStore.updateRecordingStatusOnly(
-            recording.id,
-            progress: 0.0,
-            status: .pending,
-            isRegeneration: true
-        )
-
-        try await recordingStore.updateSourceFileURL(recording.id, sourceURL: sourceURL.path)
+        guard try await recordingStore.prepareRecordingForRequeue(
+            recording,
+            sourceURL: sourceURL
+        ) else { return }
 
         startProcessingQueue()
     }

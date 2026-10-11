@@ -7,11 +7,14 @@ enum RecordingStatus: String, Codable {
     case transcribing
     case completed
     case failed
-    case deleting
 }
 
 enum QueueArtifactState: String, Codable {
     case staging
+}
+
+enum RecordingDeletionState: String, Codable {
+    case deleting
 }
 
 struct Recording: Identifiable, Codable, FetchableRecord, PersistableRecord, Equatable {
@@ -25,17 +28,19 @@ struct Recording: Identifiable, Codable, FetchableRecord, PersistableRecord, Equ
     var sourceFileURL: String?
     var preparedPCMFileURL: String? = nil
     var queueArtifactState: QueueArtifactState? = nil
+    var deletionState: RecordingDeletionState? = nil
     
     var isRegeneration: Bool = false
     
     enum CodingKeys: String, CodingKey {
         case id, timestamp, fileName, transcription, duration, status, progress, sourceFileURL,
-             preparedPCMFileURL, queueArtifactState
+             preparedPCMFileURL, queueArtifactState, deletionState
     }
 
     static func == (lhs: Recording, rhs: Recording) -> Bool {
         return lhs.id == rhs.id &&
                lhs.status == rhs.status &&
+               lhs.deletionState == rhs.deletionState &&
                lhs.progress == rhs.progress &&
                lhs.transcription == rhs.transcription &&
                lhs.isRegeneration == rhs.isRegeneration
@@ -58,7 +63,7 @@ struct Recording: Identifiable, Codable, FetchableRecord, PersistableRecord, Equ
     }
     
     var isPending: Bool {
-        status == .pending || status == .converting || status == .transcribing
+        deletionState == nil && (status == .pending || status == .converting || status == .transcribing)
     }
     
     var sourceFileName: String? {
@@ -79,6 +84,7 @@ struct Recording: Identifiable, Codable, FetchableRecord, PersistableRecord, Equ
         static let sourceFileURL = Column(CodingKeys.sourceFileURL)
         static let preparedPCMFileURL = Column(CodingKeys.preparedPCMFileURL)
         static let queueArtifactState = Column(CodingKeys.queueArtifactState)
+        static let deletionState = Column(CodingKeys.deletionState)
     }
 }
 
@@ -91,6 +97,49 @@ enum QueueArtifactCheckpoint: CaseIterable {
 }
 
 @MainActor
+final class QueueArtifactLifecycleCoordinator {
+    private var isRunning = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var activeDeletionIDs: Set<UUID> = []
+
+    func perform<T>(_ operation: () async throws -> T) async rethrows -> T {
+        await acquire()
+        defer { release() }
+        return try await operation()
+    }
+
+    func reserveDeletion(_ id: UUID) {
+        activeDeletionIDs.insert(id)
+    }
+
+    func releaseDeletion(_ id: UUID) {
+        activeDeletionIDs.remove(id)
+    }
+
+    func deletionIsActive(_ id: UUID) -> Bool {
+        activeDeletionIDs.contains(id)
+    }
+
+    private func acquire() async {
+        if !isRunning {
+            isRunning = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    private func release() {
+        guard !waiters.isEmpty else {
+            isRunning = false
+            return
+        }
+        waiters.removeFirst().resume()
+    }
+}
+
+@MainActor
 class RecordingStore: ObservableObject {
     static let shared = RecordingStore()
 
@@ -99,6 +148,7 @@ class RecordingStore: ObservableObject {
     private let initializationError: Error?
     private let reconcilesOrphanedArtifacts: Bool
     private let queueArtifactCheckpoint: ((QueueArtifactCheckpoint, Recording) throws -> Void)?
+    private let queueArtifactLifecycle = QueueArtifactLifecycleCoordinator()
 
     private convenience init() {
         let directory = Recording.recordingsDirectory.deletingLastPathComponent()
@@ -196,6 +246,15 @@ class RecordingStore: ObservableObject {
                 }
             }
         }
+
+        migrator.registerMigration("v5_add_deletion_state") { db in
+            let columns = try db.columns(in: Recording.databaseTableName)
+            if !columns.contains(where: { $0.name == "deletionState" }) {
+                try db.alter(table: Recording.databaseTableName) { table in
+                    table.add(column: "deletionState", .text)
+                }
+            }
+        }
         
         try migrator.migrate(dbQueue)
     }
@@ -221,6 +280,7 @@ class RecordingStore: ObservableObject {
         return try database().read { db in
             try Recording
                 .filter([RecordingStatus.pending.rawValue, RecordingStatus.converting.rawValue, RecordingStatus.transcribing.rawValue].contains(Recording.Columns.status))
+                .filter(Recording.Columns.deletionState == nil)
                 .order(Recording.Columns.timestamp.asc)
                 .fetchAll(db)
         }
@@ -230,6 +290,7 @@ class RecordingStore: ObservableObject {
         return try database().read { db in
             try Recording
                 .filter([RecordingStatus.pending.rawValue, RecordingStatus.converting.rawValue, RecordingStatus.transcribing.rawValue].contains(Recording.Columns.status))
+                .filter(Recording.Columns.deletionState == nil)
                 .order(Recording.Columns.timestamp.asc)
                 .limit(1)
                 .fetchOne(db)
@@ -256,36 +317,44 @@ class RecordingStore: ObservableObject {
             return
         }
 
-        let preparedPCMURL = QueuedPCMFile.url(for: id)
-        let durableSourceURL = Recording.recordingsDirectory.appendingPathComponent(fileName)
-        var recording = Recording(
-            id: id,
-            timestamp: Date(),
-            fileName: fileName,
-            transcription: "",
-            duration: duration,
-            status: .failed,
-            progress: 0,
-            sourceFileURL: url.path,
-            preparedPCMFileURL: preparedPCMURL.path,
-            queueArtifactState: .staging
-        )
-        try await insertRecording(recording)
-        try queueArtifactCheckpoint?(.beforeSourceMove, recording)
-        if url.standardizedFileURL != durableSourceURL.standardizedFileURL {
-            try await moveQueueSource(from: url, to: durableSourceURL)
+        try await queueArtifactLifecycle.perform {
+            let preparedPCMURL = QueuedPCMFile.url(for: id)
+            let durableSourceURL = Recording.recordingsDirectory.appendingPathComponent(fileName)
+            var recording = Recording(
+                id: id,
+                timestamp: Date(),
+                fileName: fileName,
+                transcription: "",
+                duration: duration,
+                status: .failed,
+                progress: 0,
+                sourceFileURL: url.path,
+                preparedPCMFileURL: preparedPCMURL.path,
+                queueArtifactState: .staging
+            )
+            try await insertRecording(recording)
+            try queueArtifactCheckpoint?(.beforeSourceMove, recording)
+            if url.standardizedFileURL != durableSourceURL.standardizedFileURL {
+                try await moveQueueSource(from: url, to: durableSourceURL)
+            }
+            try queueArtifactCheckpoint?(.afterSourceMove, recording)
+            try await writePreparedPCM(pcmSamples, to: preparedPCMURL, for: recording)
+            try queueArtifactCheckpoint?(.afterPreparedPCMWrite, recording)
+            recording.sourceFileURL = durableSourceURL.path
+            recording.status = .pending
+            recording.queueArtifactState = nil
+            try await activateStagedRecording(recording)
+            try queueArtifactCheckpoint?(.afterActivation, recording)
         }
-        try queueArtifactCheckpoint?(.afterSourceMove, recording)
-        try await writePreparedPCM(pcmSamples, to: preparedPCMURL, for: recording)
-        try queueArtifactCheckpoint?(.afterPreparedPCMWrite, recording)
-        recording.sourceFileURL = durableSourceURL.path
-        recording.status = .pending
-        recording.queueArtifactState = nil
-        try await activateStagedRecording(recording)
-        try queueArtifactCheckpoint?(.afterActivation, recording)
     }
 
     func saveFailedDictation(_ audio: RecordedAudio, error: Error) async throws -> Recording {
+        try await queueArtifactLifecycle.perform {
+            try await saveFailedDictationTransaction(audio, error: error)
+        }
+    }
+
+    private func saveFailedDictationTransaction(_ audio: RecordedAudio, error: Error) async throws -> Recording {
         let id = UUID()
         let alreadySaved = audio.url.deletingLastPathComponent().standardizedFileURL == Recording.recordingsDirectory.standardizedFileURL
         let name = alreadySaved ? audio.url.lastPathComponent : Recording.fileName(for: id)
@@ -394,6 +463,7 @@ class RecordingStore: ObservableObject {
             try Recording
                 .filter(Recording.Columns.id == recording.id)
                 .filter(Recording.Columns.queueArtifactState == QueueArtifactState.staging.rawValue)
+                .filter(Recording.Columns.deletionState == nil)
                 .updateAll(db, [
                     Recording.Columns.transcription.set(to: recording.transcription),
                     Recording.Columns.status.set(to: recording.status.rawValue),
@@ -470,7 +540,7 @@ class RecordingStore: ObservableObject {
     /// ~100 SQLite transactions per transcription. Status transitions are still
     /// persisted by the explicit update methods.
     func updateRecordingProgressTransient(_ id: UUID, progress: Float, status: RecordingStatus) {
-        if recordings.first(where: { $0.id == id })?.status == .deleting { return }
+        if recordings.first(where: { $0.id == id })?.deletionState != nil { return }
         applyLocalProgressUpdate(id, progress: progress, status: status)
     }
     
@@ -478,7 +548,7 @@ class RecordingStore: ObservableObject {
         let updated = try await database().write { db -> Int in
             try Recording
                 .filter(Recording.Columns.id == id)
-                .filter(Recording.Columns.status != RecordingStatus.deleting.rawValue)
+                .filter(Recording.Columns.deletionState == nil)
                 .updateAll(db, [
                     Recording.Columns.transcription.set(to: transcription),
                     Recording.Columns.progress.set(to: progress),
@@ -491,10 +561,20 @@ class RecordingStore: ObservableObject {
     }
 
     func completeRecording(_ recording: Recording, transcription: String) async throws {
+        guard recording.preparedPCMFileURL != nil || recording.queueArtifactState != nil else {
+            try await completeRecordingTransaction(recording, transcription: transcription)
+            return
+        }
+        try await queueArtifactLifecycle.perform {
+            try await completeRecordingTransaction(recording, transcription: transcription)
+        }
+    }
+
+    private func completeRecordingTransaction(_ recording: Recording, transcription: String) async throws {
         let updated = try await database().write { db -> Int in
             try Recording
                 .filter(Recording.Columns.id == recording.id)
-                .filter(Recording.Columns.status != RecordingStatus.deleting.rawValue)
+                .filter(Recording.Columns.deletionState == nil)
                 .updateAll(db, [
                     Recording.Columns.transcription.set(to: transcription),
                     Recording.Columns.progress.set(to: Float(1.0)),
@@ -513,10 +593,17 @@ class RecordingStore: ObservableObject {
     }
 
     func retryCompletedPreparedPCMCleanup() async throws {
+        try await queueArtifactLifecycle.perform {
+            try await retryCompletedPreparedPCMCleanupTransaction()
+        }
+    }
+
+    private func retryCompletedPreparedPCMCleanupTransaction() async throws {
         let recordings = try await database().read { db in
             try Recording
                 .filter(Recording.Columns.status == RecordingStatus.completed.rawValue)
                 .filter(Recording.Columns.preparedPCMFileURL != nil)
+                .filter(Recording.Columns.deletionState == nil)
                 .fetchAll(db)
         }
         for recording in recordings {
@@ -525,18 +612,29 @@ class RecordingStore: ObservableObject {
     }
 
     func reconcileQueueArtifactLifecycle() async throws {
-        try await recoverStagedQueueArtifacts()
-        try await retryCompletedPreparedPCMCleanup()
-        try await retryDeletingRecordings()
-        if reconcilesOrphanedArtifacts {
-            try await reconcileOrphanedQueueArtifacts()
+        try await queueArtifactLifecycle.perform {
+            try await recoverStagedQueueArtifactsTransaction()
+            try await retryCompletedPreparedPCMCleanupTransaction()
+            try await retryDeletingRecordingsTransaction()
+            if reconcilesOrphanedArtifacts {
+                try await reconcileOrphanedQueueArtifactsTransaction(
+                    artifactDirectory: QueuedPCMFile.directory
+                )
+            }
         }
     }
 
     func recoverStagedQueueArtifacts() async throws {
+        try await queueArtifactLifecycle.perform {
+            try await recoverStagedQueueArtifactsTransaction()
+        }
+    }
+
+    private func recoverStagedQueueArtifactsTransaction() async throws {
         let staged = try await database().read { db in
             try Recording
                 .filter(Recording.Columns.queueArtifactState == QueueArtifactState.staging.rawValue)
+                .filter(Recording.Columns.deletionState == nil)
                 .order(Recording.Columns.timestamp.asc)
                 .fetchAll(db)
         }
@@ -593,23 +691,11 @@ class RecordingStore: ObservableObject {
         try await activateStagedRecording(recovered)
     }
 
-    nonisolated func updateSourceFileURL(_ id: UUID, sourceURL: String) async throws {
-        try await database().write { db in
-            try Recording
-                .filter(Recording.Columns.id == id)
-                .updateAll(db, [
-                    Recording.Columns.sourceFileURL.set(to: sourceURL)
-                ])
-        }
-    }
-
     func updateRecordingStatusOnly(_ id: UUID, progress: Float, status: RecordingStatus, isRegeneration: Bool? = nil) async throws {
         let updated = try await database().write { db -> Int in
-            var request = Recording.filter(Recording.Columns.id == id)
-            if status != .deleting {
-                request = request.filter(Recording.Columns.status != RecordingStatus.deleting.rawValue)
-            }
-            return try request
+            try Recording
+                .filter(Recording.Columns.id == id)
+                .filter(Recording.Columns.deletionState == nil)
                 .updateAll(db, [
                     Recording.Columns.progress.set(to: progress),
                     Recording.Columns.status.set(to: status.rawValue)
@@ -620,9 +706,48 @@ class RecordingStore: ObservableObject {
         }
     }
 
+    func prepareRecordingForRequeue(_ recording: Recording, sourceURL: URL) async throws -> Bool {
+        let transaction: () async throws -> Bool = {
+            let updated = try await self.database().write { db -> Int in
+                try Recording
+                    .filter(Recording.Columns.id == recording.id)
+                    .filter(Recording.Columns.deletionState == nil)
+                    .updateAll(db, [
+                        Recording.Columns.progress.set(to: Float(0)),
+                        Recording.Columns.status.set(to: RecordingStatus.pending.rawValue),
+                        Recording.Columns.sourceFileURL.set(to: sourceURL.path)
+                    ])
+            }
+            if updated > 0 {
+                self.applyLocalProgressUpdate(
+                    recording.id,
+                    progress: 0,
+                    status: .pending,
+                    isRegeneration: true
+                )
+            }
+            return updated > 0
+        }
+        if recording.preparedPCMFileURL != nil || recording.queueArtifactState != nil {
+            return try await queueArtifactLifecycle.perform(transaction)
+        } else {
+            return try await transaction()
+        }
+    }
+
     private nonisolated func updateRecordingInDB(_ recording: Recording) async throws {
         try await database().write { db in
-            try recording.update(db)
+            try Recording
+                .filter(Recording.Columns.id == recording.id)
+                .filter(Recording.Columns.deletionState == nil)
+                .updateAll(db, [
+                    Recording.Columns.transcription.set(to: recording.transcription),
+                    Recording.Columns.status.set(to: recording.status.rawValue),
+                    Recording.Columns.progress.set(to: recording.progress),
+                    Recording.Columns.sourceFileURL.set(to: recording.sourceFileURL),
+                    Recording.Columns.preparedPCMFileURL.set(to: recording.preparedPCMFileURL),
+                    Recording.Columns.queueArtifactState.set(to: recording.queueArtifactState?.rawValue)
+                ])
         }
     }
 
@@ -638,9 +763,20 @@ class RecordingStore: ObservableObject {
         cancelTranscription: Bool = true,
         cancelAndWait: ((UUID) async -> Void)? = nil
     ) async throws {
-        guard let deletingRecording = try await markRecordingsForDeletion([recording.id]).first else {
-            return
+        let ownsQueueArtifact = recording.preparedPCMFileURL != nil || recording.queueArtifactState != nil
+        let deletingRecording: Recording?
+        if ownsQueueArtifact {
+            deletingRecording = try await queueArtifactLifecycle.perform {
+                let row = try await markRecordingsForDeletion([recording.id]).first
+                if row != nil {
+                    queueArtifactLifecycle.reserveDeletion(recording.id)
+                }
+                return row
+            }
+        } else {
+            deletingRecording = try await markRecordingsForDeletion([recording.id]).first
         }
+        guard let deletingRecording else { return }
         if cancelTranscription && recording.isPending {
             if let cancelAndWait {
                 await cancelAndWait(recording.id)
@@ -648,7 +784,16 @@ class RecordingStore: ObservableObject {
                 await TranscriptionQueue.shared.cancelRecordingAndWait(recording.id)
             }
         }
-        try await finishDeletingRecording(deletingRecording)
+        if ownsQueueArtifact {
+            try await queueArtifactLifecycle.perform {
+                defer {
+                    queueArtifactLifecycle.releaseDeletion(recording.id)
+                }
+                try await finishDeletingRecording(deletingRecording)
+            }
+        } else {
+            try await finishDeletingRecording(deletingRecording)
+        }
     }
 
     func deleteAllRecordings() {
@@ -660,11 +805,13 @@ class RecordingStore: ObservableObject {
 
     func deleteAllRecordingsSync() async throws {
         await TranscriptionQueue.shared.stopProcessingQueue()
-        let ids = try await database().read { db in
-            try Recording.fetchAll(db).map(\.id)
+        try await queueArtifactLifecycle.perform {
+            let ids = try await database().read { db in
+                try Recording.fetchAll(db).map(\.id)
+            }
+            let recordings = try await markRecordingsForDeletion(ids)
+            try await finishDeletingRecordings(recordings)
         }
-        let recordings = try await markRecordingsForDeletion(ids)
-        try await finishDeletingRecordings(recordings)
     }
 
     nonisolated static func retentionCutoffDate(daysToKeep: Int, now: Date = Date()) -> Date? {
@@ -691,7 +838,7 @@ class RecordingStore: ObservableObject {
                 .filter(Recording.Columns.timestamp < cutoff)
                 .filter(!Self.pendingStatuses.contains(Recording.Columns.status))
                 .filter(Recording.Columns.queueArtifactState == nil)
-                .filter(Recording.Columns.status != RecordingStatus.deleting.rawValue)
+                .filter(Recording.Columns.deletionState == nil)
             let count = try request.fetchCount(db)
             let oldest = try request
                 .order(Recording.Columns.timestamp.asc)
@@ -703,19 +850,21 @@ class RecordingStore: ObservableObject {
 
     func deleteRecordings(olderThanDays days: Int) async throws {
         guard let cutoff = Self.retentionCutoffDate(daysToKeep: days) else { return }
-        let outdated = try await database().read { db in
-            try Recording
-                .filter(Recording.Columns.timestamp < cutoff)
-                .filter(!Self.pendingStatuses.contains(Recording.Columns.status))
-                .filter(Recording.Columns.queueArtifactState == nil)
-                .filter(Recording.Columns.status != RecordingStatus.deleting.rawValue)
-                .fetchAll(db)
-        }
-        guard !outdated.isEmpty else { return }
+        try await queueArtifactLifecycle.perform {
+            let outdated = try await database().read { db in
+                try Recording
+                    .filter(Recording.Columns.timestamp < cutoff)
+                    .filter(!Self.pendingStatuses.contains(Recording.Columns.status))
+                    .filter(Recording.Columns.queueArtifactState == nil)
+                    .filter(Recording.Columns.deletionState == nil)
+                    .fetchAll(db)
+            }
+            guard !outdated.isEmpty else { return }
 
-        let ids = outdated.map(\.id)
-        let recordings = try await markRecordingsForDeletion(ids)
-        try await finishDeletingRecordings(recordings)
+            let ids = outdated.map(\.id)
+            let recordings = try await markRecordingsForDeletion(ids)
+            try await finishDeletingRecordings(recordings)
+        }
     }
 
     nonisolated static func removePreparedPCMFile(for recording: Recording) throws {
@@ -738,6 +887,7 @@ class RecordingStore: ObservableObject {
             try Recording
                 .filter(Recording.Columns.id == recording.id)
                 .filter(Recording.Columns.preparedPCMFileURL == recording.preparedPCMFileURL)
+                .filter(Recording.Columns.deletionState == nil)
                 .updateAll(db, [Recording.Columns.preparedPCMFileURL.set(to: nil)])
         }
         if let index = recordings.firstIndex(where: { $0.id == recording.id }) {
@@ -750,18 +900,17 @@ class RecordingStore: ObservableObject {
         let recordings = try await database().write { db in
             _ = try Recording
                 .filter(ids.contains(Recording.Columns.id))
-                .updateAll(db, [Recording.Columns.status.set(to: RecordingStatus.deleting.rawValue)])
+                .updateAll(db, [Recording.Columns.deletionState.set(to: RecordingDeletionState.deleting.rawValue)])
             return try Recording
                 .filter(ids.contains(Recording.Columns.id))
                 .fetchAll(db)
         }
         for recording in recordings {
-            applyLocalProgressUpdate(
-                recording.id,
-                progress: recording.progress,
-                status: .deleting
-            )
+            if let index = self.recordings.firstIndex(where: { $0.id == recording.id }) {
+                self.recordings[index].deletionState = .deleting
+            }
         }
+        NotificationCenter.default.post(name: Self.recordingsDidUpdateNotification, object: nil)
         return recordings
     }
 
@@ -773,7 +922,7 @@ class RecordingStore: ObservableObject {
         try await database().write { db in
             _ = try Recording
                 .filter(Recording.Columns.id == recording.id)
-                .filter(Recording.Columns.status == RecordingStatus.deleting.rawValue)
+                .filter(Recording.Columns.deletionState == RecordingDeletionState.deleting.rawValue)
                 .deleteAll(db)
         }
         NotificationCenter.default.post(name: Self.recordingsDidUpdateNotification, object: nil)
@@ -792,18 +941,33 @@ class RecordingStore: ObservableObject {
     }
 
     func retryDeletingRecordings() async throws {
+        try await queueArtifactLifecycle.perform {
+            try await retryDeletingRecordingsTransaction()
+        }
+    }
+
+    private func retryDeletingRecordingsTransaction() async throws {
         let recordings = try await database().read { db in
             try Recording
-                .filter(Recording.Columns.status == RecordingStatus.deleting.rawValue)
+                .filter(Recording.Columns.deletionState == RecordingDeletionState.deleting.rawValue)
                 .fetchAll(db)
         }
         for recording in recordings {
+            if queueArtifactLifecycle.deletionIsActive(recording.id) { continue }
             try? await finishDeletingRecording(recording)
         }
     }
 
     func reconcileOrphanedQueueArtifacts(
         artifactDirectory: URL = QueuedPCMFile.directory
+    ) async throws {
+        try await queueArtifactLifecycle.perform {
+            try await reconcileOrphanedQueueArtifactsTransaction(artifactDirectory: artifactDirectory)
+        }
+    }
+
+    private func reconcileOrphanedQueueArtifactsTransaction(
+        artifactDirectory: URL
     ) async throws {
         let referencedPaths = Set(try await database().read { db in
             try Recording
@@ -830,6 +994,7 @@ class RecordingStore: ObservableObject {
             try Recording
                 .filter(Recording.Columns.duration <= 0)
                 .filter(Recording.Columns.status == RecordingStatus.completed.rawValue)
+                .filter(Recording.Columns.deletionState == nil)
                 .fetchAll(db)
         }) ?? []
         guard !zeroDurationRecordings.isEmpty else { return }
@@ -882,6 +1047,7 @@ class RecordingStore: ObservableObject {
         try database().read { db in
             let cursor = try Recording
                 .filter(Recording.Columns.status == RecordingStatus.completed.rawValue)
+                .filter(Recording.Columns.deletionState == nil)
                 .order(Recording.Columns.timestamp.desc)
                 .fetchCursor(db)
             while let recording = try cursor.next() {

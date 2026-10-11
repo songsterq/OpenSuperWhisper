@@ -3,6 +3,25 @@ import GRDB
 import AVFoundation
 @testable import OpenSuperWhisper
 
+private final class ImmediateFailureTranscriptionEngine: TranscriptionEngine {
+    private struct Failure: Error {}
+
+    var isModelLoaded: Bool { true }
+    var engineName: String { "Immediate failure test engine" }
+
+    func initialize() async throws {}
+
+    func transcribeAudio(url: URL, settings: Settings) async throws -> String {
+        throw Failure()
+    }
+
+    func cancelTranscription() {}
+
+    func getSupportedLanguages() -> [String] {
+        ["en"]
+    }
+}
+
 @MainActor
 final class FailedAudioPreservationTests: XCTestCase {
     func testFailedDictationKeepsAudioAndCanBeRetried() async throws {
@@ -238,6 +257,83 @@ final class FailedAudioPreservationTests: XCTestCase {
         XCTAssertEqual(try QueuedPCMFile.read(from: preparedURL).count, 2048)
     }
 
+    func testQueueStartupWaitsForLiveRecorderArtifactStaging() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("serialized-staging-\(UUID())", isDirectory: true)
+        let source = directory.appendingPathComponent("recorded.wav")
+        let imported = directory.appendingPathComponent("imported.wav")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let format = try XCTUnwrap(AVAudioFormat(
+            standardFormatWithSampleRate: 16000,
+            channels: 1
+        ))
+        let writer = try PCMRecordingWriter(url: source, inputFormat: format)
+        let sampleCount = QueuedPCMFile.maximumWriteBufferFrames + 257
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(
+            pcmFormat: format,
+            frameCapacity: AVAudioFrameCount(sampleCount)
+        ))
+        buffer.frameLength = AVAudioFrameCount(sampleCount)
+        for index in 0..<sampleCount {
+            buffer.floatChannelData![0][index] = Float(index % 97) / 97
+        }
+        try writer.append(buffer)
+        let audio = try writer.finish()
+        try FileManager.default.copyItem(at: source, to: imported)
+
+        let writeStarted = DispatchSemaphore(value: 0)
+        let allowWrite = DispatchSemaphore(value: 0)
+        let checkpointLock = NSLock()
+        var didPauseWrite = false
+        let store = try RecordingStore(
+            databaseQueue: DatabaseQueue(),
+            queueArtifactCheckpoint: { checkpoint, _ in
+                guard checkpoint == .duringPreparedPCMWrite else { return }
+                checkpointLock.lock()
+                let shouldPause = !didPauseWrite
+                didPauseWrite = true
+                checkpointLock.unlock()
+                guard shouldPause else { return }
+                writeStarted.signal()
+                _ = allowWrite.wait(timeout: .now() + 5)
+            }
+        )
+        let service = TranscriptionService(engine: ImmediateFailureTranscriptionEngine())
+        let queue = TranscriptionQueue(transcriptionService: service, recordingStore: store)
+
+        let staging = Task {
+            try await store.addQueuedRecording(
+                url: source,
+                duration: audio.duration,
+                pcmSamples: audio.samples
+            )
+        }
+        await Task.detached {
+            _ = writeStarted.wait(timeout: .now() + 5)
+        }.value
+
+        await queue.addFileToQueue(url: imported)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let rowsDuringWrite = try await store.fetchRecordings(limit: 10, offset: 0)
+        XCTAssertEqual(rowsDuringWrite.filter { $0.queueArtifactState == .staging }.count, 1)
+        XCTAssertTrue(queue.isProcessing)
+
+        allowWrite.signal()
+        try await staging.value
+        for _ in 0..<200 where queue.isProcessing {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        let rows = try await store.fetchRecordings(limit: 10, offset: 0)
+        let recorded = try XCTUnwrap(rows.first { $0.preparedPCMFileURL != nil })
+        let preparedURL = URL(fileURLWithPath: try XCTUnwrap(recorded.preparedPCMFileURL))
+        XCTAssertNil(recorded.queueArtifactState)
+        XCTAssertEqual(try QueuedPCMFile.read(from: preparedURL), audio.samples)
+        try await store.deleteAllRecordingsSync()
+    }
+
     func testClosingFailedPCMWriterPreservesAlreadyWrittenFrames() throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".wav")
         defer { try? FileManager.default.removeItem(at: url) }
@@ -264,7 +360,8 @@ final class FailedAudioPreservationTests: XCTestCase {
         }
 
         for event in TerminalEvent.allCases {
-            let store = try RecordingStore(databaseQueue: DatabaseQueue())
+            let database = try DatabaseQueue()
+            let store = try RecordingStore(databaseQueue: database)
             let source = FileManager.default.temporaryDirectory
                 .appendingPathComponent("pcm-lifecycle-\(UUID()).wav")
             try Data([1, 2, 3]).write(to: source)
@@ -290,7 +387,15 @@ final class FailedAudioPreservationTests: XCTestCase {
                 try FileManager.default.removeItem(at: preparedURL)
                 try await store.retryCompletedPreparedPCMCleanup()
             case .interruptedDeletion:
-                try await store.updateRecordingStatusOnly(row.id, progress: 0, status: .deleting)
+                try await database.write { db in
+                    try Recording
+                        .filter(Recording.Columns.id == row.id)
+                        .updateAll(db, [
+                            Recording.Columns.deletionState.set(
+                                to: RecordingDeletionState.deleting.rawValue
+                            )
+                        ])
+                }
                 try await store.retryDeletingRecordings()
             }
 

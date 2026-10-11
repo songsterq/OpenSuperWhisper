@@ -498,10 +498,10 @@ final class TranscriptionCancellationTests: XCTestCase {
         var tombstone: Recording?
         for _ in 0..<100 {
             tombstone = try await store.fetchRecordings(limit: 1, offset: 0).first
-            if tombstone?.status == .deleting { break }
+            if tombstone?.deletionState == .deleting { break }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
-        XCTAssertEqual(tombstone?.status, .deleting)
+        XCTAssertEqual(tombstone?.deletionState, .deleting)
         XCTAssertTrue(FileManager.default.fileExists(atPath: preparedURL.path))
 
         engine.completeHeldPCM(with: "late result")
