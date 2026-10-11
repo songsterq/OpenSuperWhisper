@@ -88,6 +88,60 @@ private final class ControlledTranscriptionEngine: TranscriptionEngine {
     }
 }
 
+private final class QueueInputCapturingFluidAudioEngine: FluidAudioEngine {
+    enum Input: Equatable {
+        case file(URL)
+        case pcm([Float])
+    }
+
+    private struct CapturedInputError: Error {}
+
+    private let lock = NSLock()
+    private var inputsStorage: [Input] = []
+    private var heldFileContinuation: CheckedContinuation<String, Error>?
+    private var shouldHoldNextFile = true
+
+    override var isModelLoaded: Bool { true }
+
+    var inputs: [Input] {
+        lock.lock()
+        defer { lock.unlock() }
+        return inputsStorage
+    }
+
+    override func initialize() async throws {}
+
+    override func transcribeAudio(url: URL, settings: Settings) async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            inputsStorage.append(.file(url))
+            if shouldHoldNextFile {
+                shouldHoldNextFile = false
+                heldFileContinuation = continuation
+                lock.unlock()
+            } else {
+                lock.unlock()
+                continuation.resume(throwing: CapturedInputError())
+            }
+        }
+    }
+
+    override func transcribeSamples(_ samples: [Float], settings: Settings) async throws -> String {
+        lock.lock()
+        inputsStorage.append(.pcm(samples))
+        lock.unlock()
+        throw CapturedInputError()
+    }
+
+    func completeHeldFile() {
+        lock.lock()
+        let continuation = heldFileContinuation
+        heldFileContinuation = nil
+        lock.unlock()
+        continuation?.resume(returning: "busy transcription")
+    }
+}
+
 @MainActor
 final class TranscriptionCancellationTests: XCTestCase {
     private let audioURL = URL(fileURLWithPath: "/tmp/osw-cancellation-test.wav")
@@ -225,6 +279,65 @@ final class TranscriptionCancellationTests: XCTestCase {
         }
         XCTAssertFalse(queue.isProcessing)
         XCTAssertEqual(engine.startCount, 1)
+    }
+
+    func testBusyDictationQueuesPCMWhileFileImportStaysURLBased() async throws {
+        let engine = QueueInputCapturingFluidAudioEngine()
+        let service = TranscriptionService(engine: engine)
+        let store = try RecordingStore(databaseQueue: DatabaseQueue())
+        let queue = TranscriptionQueue(transcriptionService: service, recordingStore: store)
+        let blockerURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("osw-queue-blocker-\(UUID()).wav")
+        let recordingURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("osw-queued-recording-\(UUID()).wav")
+        let importURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("osw-queued-import-\(UUID()).wav")
+        try Data([1]).write(to: blockerURL)
+        try Data([2]).write(to: recordingURL)
+        try Data([3]).write(to: importURL)
+        defer {
+            try? FileManager.default.removeItem(at: blockerURL)
+            try? FileManager.default.removeItem(at: recordingURL)
+            try? FileManager.default.removeItem(at: importURL)
+        }
+
+        let blocker = Task {
+            try await service.transcribeAudio(url: blockerURL, settings: Settings())
+        }
+        for _ in 0..<100 where engine.inputs.count < 1 {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(engine.inputs, [.file(blockerURL)])
+
+        let samples: [Float] = [0.25, -0.25, 0.5]
+        let viewModel = IndicatorViewModel(
+            transcriptionService: service,
+            recordingStore: store,
+            transcriptionQueue: queue,
+            stopRecording: { RecordedAudio(url: recordingURL, samples: samples) },
+            cancelAudioRecording: {}
+        )
+        defer { viewModel.cleanup() }
+        viewModel.state = .recording
+        viewModel.startDecoding()
+
+        for _ in 0..<100 where (try store.getPendingRecordings()).isEmpty {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(try store.getPendingRecordings().count, 1)
+
+        engine.completeHeldFile()
+        XCTAssertEqual(try await blocker.value, "busy transcription")
+        for _ in 0..<100 where engine.inputs.count < 2 || queue.isProcessing {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(try XCTUnwrap(engine.inputs.dropFirst().first), .pcm(samples))
+
+        await queue.addFileToQueue(url: importURL)
+        for _ in 0..<100 where engine.inputs.count < 3 || queue.isProcessing {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(try XCTUnwrap(engine.inputs.dropFirst(2).first), .file(importURL))
     }
 
     func testDecodingErrorPreservesFailedRecording() async throws {
