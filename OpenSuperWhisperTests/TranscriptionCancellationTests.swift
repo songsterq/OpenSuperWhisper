@@ -100,6 +100,7 @@ private final class QueueInputCapturingFluidAudioEngine: FluidAudioEngine {
     private var inputsStorage: [Input] = []
     private var heldFileContinuation: CheckedContinuation<String, Error>?
     private var shouldHoldNextFile = true
+    private var successfulPCMText: String?
 
     override var isModelLoaded: Bool { true }
 
@@ -129,8 +130,16 @@ private final class QueueInputCapturingFluidAudioEngine: FluidAudioEngine {
     override func transcribeSamples(_ samples: [Float], settings: Settings) async throws -> String {
         lock.lock()
         inputsStorage.append(.pcm(samples))
+        let text = successfulPCMText
         lock.unlock()
+        if let text { return text }
         throw CapturedInputError()
+    }
+
+    func succeedPCM(with text: String) {
+        lock.lock()
+        successfulPCMText = text
+        lock.unlock()
     }
 
     func completeHeldFile() {
@@ -259,9 +268,11 @@ final class TranscriptionCancellationTests: XCTestCase {
         try Data([1]).write(to: source)
         defer { try? FileManager.default.removeItem(at: source) }
         let id = UUID()
+        let preparedURL = QueuedPCMFile.url(for: id)
+        try QueuedPCMFile.write([0.25], to: preparedURL)
         let recording = Recording(id: id, timestamp: Date(), fileName: Recording.fileName(for: id),
                                   transcription: "", duration: 1, status: .pending, progress: 0,
-                                  sourceFileURL: source.path)
+                                  sourceFileURL: source.path, preparedPCMFileURL: preparedURL.path)
         try await store.addRecordingSync(recording)
         queue.startProcessingQueue()
         for _ in 0..<100 where queue.currentRecordingId != id {
@@ -269,7 +280,8 @@ final class TranscriptionCancellationTests: XCTestCase {
         }
         XCTAssertEqual(queue.currentRecordingId, id)
         queue.cancelRecording(id)
-        try await store.deleteRecordingSync(recording)
+        try await store.deleteRecordingSync(recording, cancelTranscription: false)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: preparedURL.path))
         XCTAssertEqual(engine.cancelCount, 0)
         XCTAssertTrue(engine.complete(url: audioURL, with: .success("dictation survives")))
         let result = try await dictation.value
@@ -327,7 +339,8 @@ final class TranscriptionCancellationTests: XCTestCase {
         XCTAssertEqual(try store.getPendingRecordings().count, 1)
 
         engine.completeHeldFile()
-        XCTAssertEqual(try await blocker.value, "busy transcription")
+        let blockerText = try await blocker.value
+        XCTAssertEqual(blockerText, "busy transcription")
         for _ in 0..<100 where engine.inputs.count < 2 || queue.isProcessing {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
@@ -357,7 +370,8 @@ final class TranscriptionCancellationTests: XCTestCase {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
 
-        var recording = try XCTUnwrap(try await store.fetchRecordings(limit: 1, offset: 0).first)
+        var fetched = try await store.fetchRecordings(limit: 1, offset: 0)
+        var recording = try XCTUnwrap(fetched.first)
         let preparedURL = URL(fileURLWithPath: try XCTUnwrap(recording.preparedPCMFileURL))
         XCTAssertEqual(recording.status, .failed)
         XCTAssertTrue(FileManager.default.fileExists(atPath: preparedURL.path))
@@ -369,7 +383,8 @@ final class TranscriptionCancellationTests: XCTestCase {
         }
 
         XCTAssertEqual(engine.inputs, [.pcm(samples), .pcm(samples)])
-        recording = try XCTUnwrap(try await store.fetchRecordings(limit: 1, offset: 0).first)
+        fetched = try await store.fetchRecordings(limit: 1, offset: 0)
+        recording = try XCTUnwrap(fetched.first)
         XCTAssertEqual(recording.status, .failed)
         XCTAssertEqual(recording.preparedPCMFileURL, preparedURL.path)
         XCTAssertTrue(FileManager.default.fileExists(atPath: preparedURL.path))
@@ -410,18 +425,19 @@ final class TranscriptionCancellationTests: XCTestCase {
         for _ in 0..<100 where (try store.getPendingRecordings()).count < 2 {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
-        let waiting = try XCTUnwrap(
-            try store.getPendingRecordings().first { $0.sourceFileURL == waitingURL.path }
-        )
+        let waiting = try XCTUnwrap(try store.getPendingRecordings().last)
         let preparedURL = URL(fileURLWithPath: try XCTUnwrap(waiting.preparedPCMFileURL))
         XCTAssertNotEqual(queue.currentRecordingId, waiting.id)
+        XCTAssertNotEqual(waiting.sourceFileURL, waitingURL.path)
+        XCTAssertTrue(try XCTUnwrap(waiting.sourceFileURL).hasPrefix(Recording.recordingsDirectory.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: preparedURL.path))
 
         try await store.deleteRecordingSync(waiting, cancelTranscription: false)
         XCTAssertFalse(FileManager.default.fileExists(atPath: preparedURL.path))
 
         engine.completeHeldFile()
-        XCTAssertEqual(try await blocker.value, "busy transcription")
+        let blockerText = try await blocker.value
+        XCTAssertEqual(blockerText, "busy transcription")
         for _ in 0..<100 where queue.isProcessing {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
@@ -464,7 +480,8 @@ final class TranscriptionCancellationTests: XCTestCase {
 
         let stop = Task { await firstQueue.stopProcessingQueue() }
         firstEngine.completeHeldFile()
-        XCTAssertEqual(try await blocker.value, "busy transcription")
+        let blockerText = try await blocker.value
+        XCTAssertEqual(blockerText, "busy transcription")
         await stop.value
 
         let secondEngine = QueueInputCapturingFluidAudioEngine()
@@ -480,39 +497,82 @@ final class TranscriptionCancellationTests: XCTestCase {
         }
 
         XCTAssertEqual(secondEngine.inputs, [.pcm(samples)])
-        let recovered = try XCTUnwrap(try await secondStore.fetchRecordings(limit: 1, offset: 0).first)
+        let recoveredRows = try await secondStore.fetchRecordings(limit: 1, offset: 0)
+        let recovered = try XCTUnwrap(recoveredRows.first)
         XCTAssertEqual(recovered.status, .failed)
         XCTAssertEqual(recovered.preparedPCMFileURL, preparedURL.path)
         try await secondStore.deleteRecordingSync(recovered, cancelTranscription: false)
         XCTAssertFalse(FileManager.default.fileExists(atPath: preparedURL.path))
     }
 
-    func testDecodingErrorPreservesFailedRecording() async throws {
-        let engine = ControlledTranscriptionEngine()
+    func testDirectPCMFailurePersistsPreparedAudioForRetry() async throws {
+        let engine = QueueInputCapturingFluidAudioEngine()
         let service = TranscriptionService(engine: engine)
         let store = try RecordingStore(databaseQueue: DatabaseQueue())
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".wav")
         try Data([1, 2]).write(to: url)
         defer { try? FileManager.default.removeItem(at: url); AppErrorCenter.shared.issue = nil }
+        let samples: [Float] = [0.125, -0.25, 0.5]
         let vm = IndicatorViewModel(transcriptionService: service, recordingStore: store,
-                                    stopRecording: { RecordedAudio(url: url, samples: []) }, cancelAudioRecording: {})
+                                    stopRecording: { RecordedAudio(url: url, samples: samples) }, cancelAudioRecording: {})
         vm.state = .recording
-        let started = expectation(description: "decode started")
-        engine.notifyOnNextStart { started.fulfill() }
         vm.startDecoding()
-        await fulfillment(of: [started], timeout: 2)
-        XCTAssertTrue(engine.complete(url: url, with: .failure(TranscriptionError.processingFailed)))
         var rows: [Recording] = []
         for _ in 0..<100 {
             rows = try await store.fetchRecordings(limit: 10, offset: 0)
             if !rows.isEmpty { break }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
-        let row = try XCTUnwrap(rows.first)
-        defer { try? FileManager.default.removeItem(at: row.url); vm.cleanup() }
+        var row = try XCTUnwrap(rows.first)
+        let preparedURL = URL(fileURLWithPath: try XCTUnwrap(row.preparedPCMFileURL))
+        defer {
+            try? FileManager.default.removeItem(at: row.url)
+            try? FileManager.default.removeItem(at: preparedURL)
+            vm.cleanup()
+        }
         XCTAssertEqual(row.status, .failed)
         XCTAssertEqual(try Data(contentsOf: row.url), Data([1, 2]))
+        XCTAssertEqual(engine.inputs, [.pcm(samples)])
+        XCTAssertEqual(try QueuedPCMFile.read(from: preparedURL), samples)
+
+        let queue = TranscriptionQueue(transcriptionService: service, recordingStore: store)
+        await queue.requeueRecording(row)
+        for _ in 0..<100 where engine.inputs.count < 2 || queue.isProcessing {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        rows = try await store.fetchRecordings(limit: 1, offset: 0)
+        row = try XCTUnwrap(rows.first)
+
+        XCTAssertEqual(engine.inputs, [.pcm(samples), .pcm(samples)])
+        XCTAssertEqual(row.preparedPCMFileURL, preparedURL.path)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: preparedURL.path))
         XCTAssertTrue(service.transcribedText.isEmpty)
+    }
+
+    func testSuccessfulQueuedDictationRemovesPreparedPCMAndClearsReference() async throws {
+        let engine = QueueInputCapturingFluidAudioEngine()
+        engine.succeedPCM(with: "completed")
+        let service = TranscriptionService(engine: engine)
+        let store = try RecordingStore(databaseQueue: DatabaseQueue())
+        let queue = TranscriptionQueue(transcriptionService: service, recordingStore: store)
+        let source = FileManager.default.temporaryDirectory
+            .appendingPathComponent("osw-queue-success-\(UUID()).wav")
+        try Data([8, 9]).write(to: source)
+        let samples: [Float] = [0.25, -0.25]
+
+        await queue.addRecordedAudioToQueue(RecordedAudio(url: source, samples: samples))
+        for _ in 0..<100 where queue.isProcessing {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let rows = try await store.fetchRecordings(limit: 1, offset: 0)
+        let row = try XCTUnwrap(rows.first)
+        defer { try? FileManager.default.removeItem(at: row.url) }
+
+        XCTAssertEqual(row.status, .completed)
+        XCTAssertEqual(row.transcription, "completed")
+        XCTAssertNil(row.preparedPCMFileURL)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: QueuedPCMFile.url(for: row.id).path))
+        XCTAssertEqual(engine.inputs, [.pcm(samples)])
     }
 
     func testScopedCancellationDoesNotCancelDifferentOperation() async throws {

@@ -75,6 +75,7 @@ class TranscriptionQueue: ObservableObject {
 
         processingTask = Task {
             do {
+                try await recordingStore.retryCompletedPreparedPCMCleanup()
                 try await cleanupMissingFiles()
                 try await processQueue()
             } catch is CancellationError {
@@ -132,38 +133,11 @@ class TranscriptionQueue: ObservableObject {
         errorTitle: String
     ) async {
         do {
-            let timestamp = Date()
-            let id = UUID()
-            let fileName = Recording.fileName(for: id)
-            let preparedPCMURL = pcmSamples.map { _ in QueuedPCMFile.url(for: url) }
-
-            if let pcmSamples, let preparedPCMURL {
-                try await Task.detached(priority: .userInitiated) {
-                    try QueuedPCMFile.write(pcmSamples, to: preparedPCMURL)
-                }.value
-            }
-
-            let recording = Recording(
-                id: id,
-                timestamp: timestamp,
-                fileName: fileName,
-                transcription: "",
+            try await recordingStore.addQueuedRecording(
+                url: url,
                 duration: duration,
-                status: .pending,
-                progress: 0.0,
-                sourceFileURL: url.path,
-                preparedPCMFileURL: preparedPCMURL?.path
+                pcmSamples: pcmSamples
             )
-
-            do {
-                try await recordingStore.addRecordingSync(recording)
-            } catch {
-                if let preparedPCMURL {
-                    try? FileManager.default.removeItem(at: preparedPCMURL)
-                }
-                throw error
-            }
-
             startProcessingQueue()
         } catch {
             AppErrorCenter.shared.report(errorTitle, error: error)
@@ -209,8 +183,15 @@ class TranscriptionQueue: ObservableObject {
         startProcessingQueue()
     }
 
-    nonisolated static func shouldDiscardEmptyDictation(text: String, sourceURL: URL) -> Bool {
-        text.isEmpty && sourceURL.path.hasPrefix(AudioRecorder.temporaryRecordingsDirectory.path)
+    nonisolated static func shouldDiscardEmptyDictation(
+        text: String,
+        sourceURL: URL,
+        preparedPCMFileURL: String? = nil
+    ) -> Bool {
+        text.isEmpty && (
+            preparedPCMFileURL != nil ||
+            sourceURL.path.hasPrefix(AudioRecorder.temporaryRecordingsDirectory.path)
+        )
     }
 
     private func processQueue() async throws {
@@ -287,7 +268,7 @@ class TranscriptionQueue: ObservableObject {
                 }
 
                 let settings = Settings()
-                let pcmSamples = try await Task.detached(priority: .userInitiated) {
+                let pcmSamples: [Float]? = try await Task.detached(priority: .userInitiated) {
                     guard let path = recording.preparedPCMFileURL else { return nil }
                     return try QueuedPCMFile.read(from: URL(fileURLWithPath: path))
                 }.value
@@ -302,7 +283,11 @@ class TranscriptionQueue: ObservableObject {
                     return
                 }
 
-                if Self.shouldDiscardEmptyDictation(text: text, sourceURL: sourceURL) {
+                if Self.shouldDiscardEmptyDictation(
+                    text: text,
+                    sourceURL: sourceURL,
+                    preparedPCMFileURL: recording.preparedPCMFileURL
+                ) {
                     await Task.detached(priority: .utility) {
                         try? FileManager.default.removeItem(at: sourceURL)
                     }.value
@@ -328,8 +313,7 @@ class TranscriptionQueue: ObservableObject {
                     }
                 }.value
 
-                try await recordingStore.completeRecording(recording.id, transcription: text)
-                try? RecordingStore.removePreparedPCMFile(for: recording)
+                try await recordingStore.completeRecording(recording, transcription: text)
 
             } catch {
                 if !isRecordingCancelled(recording.id) && !Task.isCancelled {

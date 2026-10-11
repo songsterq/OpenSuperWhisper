@@ -14,7 +14,15 @@ struct RecordingCaptureError: Error {
 }
 
 enum QueuedPCMFile {
-    static func url(for sourceURL: URL) -> URL {
+    static var directory: URL {
+        Recording.recordingsDirectory.appendingPathComponent("prepared-pcm", isDirectory: true)
+    }
+
+    static func url(for recordingID: UUID) -> URL {
+        directory.appendingPathComponent("\(recordingID.uuidString).wav")
+    }
+
+    static func legacyURL(for sourceURL: URL) -> URL {
         sourceURL.appendingPathExtension("prepared.wav")
     }
 
@@ -39,13 +47,24 @@ enum QueuedPCMFile {
             guard let baseAddress = source.baseAddress else { return }
             buffer.floatChannelData![0].update(from: baseAddress, count: samples.count)
         }
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let temporaryURL = url.deletingLastPathComponent()
+            .appendingPathComponent(".\(url.deletingPathExtension().lastPathComponent).\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: temporaryURL) }
         let file = try AVAudioFile(
-            forWriting: url,
+            forWriting: temporaryURL,
             settings: format.settings,
             commonFormat: .pcmFormatFloat32,
             interleaved: false
         )
         try file.write(from: buffer)
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+        try FileManager.default.moveItem(at: temporaryURL, to: url)
     }
 
     static func read(from url: URL) throws -> [Float] {
@@ -54,19 +73,31 @@ enum QueuedPCMFile {
         guard format.sampleRate == 16000,
               format.channelCount == 1,
               file.length >= 0,
-              file.length <= AVAudioFramePosition(UInt32.max),
-              let buffer = AVAudioPCMBuffer(
-                pcmFormat: format,
-                frameCapacity: AVAudioFrameCount(max(file.length, 1))
-              ) else {
+              file.length <= AVAudioFramePosition(UInt32.max) else {
             throw TranscriptionError.audioConversionFailed
         }
 
-        try file.read(into: buffer)
-        guard let samples = buffer.floatChannelData?[0] else {
-            throw TranscriptionError.audioConversionFailed
+        var result: [Float] = []
+        result.reserveCapacity(Int(file.length))
+        while file.framePosition < file.length {
+            let remaining = file.length - file.framePosition
+            guard let buffer = AVAudioPCMBuffer(
+                pcmFormat: format,
+                frameCapacity: AVAudioFrameCount(min(remaining, 65_536))
+            ) else {
+                throw TranscriptionError.audioConversionFailed
+            }
+            try file.read(into: buffer)
+            guard buffer.frameLength > 0,
+                  let samples = buffer.floatChannelData?[0] else {
+                throw TranscriptionError.audioConversionFailed
+            }
+            result.append(contentsOf: UnsafeBufferPointer(
+                start: samples,
+                count: Int(buffer.frameLength)
+            ))
         }
-        return Array(UnsafeBufferPointer(start: samples, count: Int(buffer.frameLength)))
+        return result
     }
 }
 
