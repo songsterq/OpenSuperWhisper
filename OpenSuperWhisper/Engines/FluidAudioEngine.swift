@@ -34,29 +34,35 @@ class FluidAudioEngine: TranscriptionEngine {
         asrModels = models
     }
     
-    private enum AudioInput {
-        case file(URL)
-        case pcm([Float])
-    }
-
     func transcribeAudio(url: URL, settings: Settings) async throws -> String {
-        try await transcribe(input: .file(url), settings: settings)
+        isCancelled = false
+        // Use the app's active-channel mixer instead of FluidAudio's generic
+        // AVAudioConverter downmix so queued/imported multi-channel files match
+        // the recorder's immediate prepared-PCM path.
+        guard let samples = try await WhisperEngine().convertAudioToPCM(
+            fileURL: url,
+            cancellationCheck: { [weak self] in self?.isCancelled ?? true }
+        ) else {
+            if isCancelled || Task.isCancelled { throw CancellationError() }
+            throw TranscriptionError.audioConversionFailed
+        }
+        guard !isCancelled else { throw CancellationError() }
+        return try await transcribeSamples(samples, settings: settings)
     }
 
-    /// Transcribes 16 kHz mono samples already mixed by the recorder.
-    /// Reading the multi-channel WAV instead lets FluidAudio downmix it with
-    /// AVAudioConverter, which yields silence when speech is only on one of
-    /// several unlabeled channels (e.g. interfaces exposing loopback inputs).
+    /// Transcribes 16 kHz mono samples prepared by live capture or the shared
+    /// file decoder, avoiding FluidAudio's generic multi-channel downmix.
     func transcribeSamples(_ samples: [Float], settings: Settings) async throws -> String {
-        try await transcribe(input: .pcm(samples), settings: settings)
+        try Task.checkCancellation()
+        isCancelled = false
+        return try await transcribePreparedSamples(samples, settings: settings)
     }
 
-    private func transcribe(input: AudioInput, settings: Settings) async throws -> String {
+    private func transcribePreparedSamples(_ samples: [Float], settings: Settings) async throws -> String {
         guard let asrManager = asrManager else {
             throw TranscriptionError.contextInitializationFailed
         }
-        
-        isCancelled = false
+        guard !samples.isEmpty else { throw TranscriptionError.audioConversionFailed }
         
         // Notify start
         onProgressUpdate?(0.02)
@@ -98,13 +104,7 @@ class FluidAudioEngine: TranscriptionEngine {
         // Perform actual transcription - FluidAudio will emit progress automatically
         // FluidAudio 0.15.x requires an explicit decoder state per transcription.
         var decoderState = try TdtDecoderState(decoderLayers: await asrManager.decoderLayerCount)
-        let result: ASRResult
-        switch input {
-        case .file(let url):
-            result = try await asrManager.transcribe(url, decoderState: &decoderState)
-        case .pcm(let samples):
-            result = try await asrManager.transcribe(samples, decoderState: &decoderState)
-        }
+        let result = try await asrManager.transcribe(samples, decoderState: &decoderState)
         
         guard !isCancelled else {
             throw CancellationError()
@@ -139,4 +139,3 @@ class FluidAudioEngine: TranscriptionEngine {
         )
     }
 }
-

@@ -48,7 +48,6 @@ class IndicatorViewModel: ObservableObject {
     init(
         transcriptionService: TranscriptionService = .shared,
         recordingStore: RecordingStore = .shared,
-        transcriptionQueue: TranscriptionQueue = .shared,
         stopRecording: @escaping () async -> RecordedAudio? = {
             await AudioRecorder.shared.stopRecording()
         },
@@ -58,7 +57,7 @@ class IndicatorViewModel: ObservableObject {
     ) {
         self.recordingStore = recordingStore
         self.transcriptionService = transcriptionService
-        self.transcriptionQueue = transcriptionQueue
+        self.transcriptionQueue = TranscriptionQueue.shared
         self.stopRecordingOperation = stopRecording
         self.cancelAudioRecordingOperation = cancelAudioRecording
         
@@ -207,7 +206,7 @@ class IndicatorViewModel: ObservableObject {
                     self.recordingSessionID = nil
                 }
                 if let audio = await self.stopRecordingOperation() {
-                    await self.transcriptionQueue.addRecordedAudioToQueue(audio)
+                    await self.transcriptionQueue.addFileToQueue(url: audio.url)
                 }
             }
             showBusyMessage()

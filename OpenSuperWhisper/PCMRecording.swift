@@ -13,118 +13,33 @@ struct RecordingCaptureError: Error {
     let underlying: Error
 }
 
-enum QueuedPCMFile {
-    struct WriteMetrics: Equatable {
-        let chunkCount: Int
-        let maximumBufferFrames: Int
-    }
+enum ActiveChannelMixer {
+    private static let activityThreshold: Float = 0.0001
 
-    static let maximumWriteBufferFrames = 65_536
-
-    static var directory: URL {
-        Recording.recordingsDirectory.appendingPathComponent("prepared-pcm", isDirectory: true)
-    }
-
-    static func url(for recordingID: UUID) -> URL {
-        directory.appendingPathComponent("\(recordingID.uuidString).wav")
-    }
-
-    static func legacyURL(for sourceURL: URL) -> URL {
-        sourceURL.appendingPathExtension("prepared.wav")
-    }
-
-    @discardableResult
-    static func write(
-        _ samples: [Float],
-        to url: URL,
-        afterChunk: ((Int) throws -> Void)? = nil
-    ) throws -> WriteMetrics {
-        guard samples.count <= Int(UInt32.max) else {
-            throw TranscriptionError.audioConversionFailed
+    /// Mixes equally-sized channel buffers while excluding channels that are
+    /// effectively silent for this buffer. Keeping this logic shared ensures
+    /// live capture and file decoding make the same channel-selection choice.
+    static func mix<Channel>(_ channels: [Channel]) -> [Float]
+    where Channel: RandomAccessCollection, Channel.Element == Float, Channel.Index == Int {
+        guard let first = channels.first, !first.isEmpty,
+              channels.allSatisfy({ $0.startIndex == first.startIndex && $0.endIndex == first.endIndex }) else {
+            return []
         }
-        guard let format = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: 16000,
-            channels: 1,
-            interleaved: false
-        ) else {
-            throw TranscriptionError.audioConversionFailed
-        }
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        let temporaryURL = url.deletingLastPathComponent()
-            .appendingPathComponent(".\(url.deletingPathExtension().lastPathComponent).\(UUID().uuidString).wav")
-        defer { try? FileManager.default.removeItem(at: temporaryURL) }
-        let file = try AVAudioFile(
-            forWriting: temporaryURL,
-            settings: format.settings,
-            commonFormat: .pcmFormatFloat32,
-            interleaved: false
-        )
-        let bufferCapacity = min(max(samples.count, 1), maximumWriteBufferFrames)
-        guard let buffer = AVAudioPCMBuffer(
-            pcmFormat: format,
-            frameCapacity: AVAudioFrameCount(bufferCapacity)
-        ) else {
-            throw TranscriptionError.audioConversionFailed
-        }
-        var chunkCount = 0
-        var maximumBufferFrames = 0
-        for offset in stride(from: 0, to: samples.count, by: maximumWriteBufferFrames) {
-            let count = min(maximumWriteBufferFrames, samples.count - offset)
-            buffer.frameLength = AVAudioFrameCount(count)
-            samples.withUnsafeBufferPointer { source in
-                buffer.floatChannelData![0].update(
-                    from: source.baseAddress! + offset,
-                    count: count
-                )
-            }
-            try file.write(from: buffer)
-            chunkCount += 1
-            maximumBufferFrames = max(maximumBufferFrames, count)
-            try afterChunk?(chunkCount)
-        }
-        if FileManager.default.fileExists(atPath: url.path) {
-            try FileManager.default.removeItem(at: url)
-        }
-        try FileManager.default.moveItem(at: temporaryURL, to: url)
-        return WriteMetrics(
-            chunkCount: chunkCount,
-            maximumBufferFrames: maximumBufferFrames
-        )
-    }
+        if channels.count == 1 { return Array(first) }
 
-    static func read(from url: URL) throws -> [Float] {
-        let file = try AVAudioFile(forReading: url)
-        let format = file.processingFormat
-        guard format.sampleRate == 16000,
-              format.channelCount == 1,
-              file.length >= 0,
-              file.length <= AVAudioFramePosition(UInt32.max) else {
-            throw TranscriptionError.audioConversionFailed
+        let active = channels.indices.filter { channel in
+            var energy: Float = 0
+            for sample in channels[channel] { energy += sample * sample }
+            return sqrtf(energy / Float(first.count)) > activityThreshold
         }
-
+        let selected = active.isEmpty ? Array(channels.indices) : active
+        let normalization = 1 / Float(selected.count)
         var result: [Float] = []
-        result.reserveCapacity(Int(file.length))
-        while file.framePosition < file.length {
-            let remaining = file.length - file.framePosition
-            guard let buffer = AVAudioPCMBuffer(
-                pcmFormat: format,
-                frameCapacity: AVAudioFrameCount(min(remaining, 65_536))
-            ) else {
-                throw TranscriptionError.audioConversionFailed
-            }
-            try file.read(into: buffer)
-            guard buffer.frameLength > 0,
-                  let samples = buffer.floatChannelData?[0] else {
-                throw TranscriptionError.audioConversionFailed
-            }
-            result.append(contentsOf: UnsafeBufferPointer(
-                start: samples,
-                count: Int(buffer.frameLength)
-            ))
+        result.reserveCapacity(first.count)
+        for frame in first.indices {
+            var sample: Float = 0
+            for channel in selected { sample += channels[channel][frame] }
+            result.append(sample * normalization)
         }
         return result
     }
@@ -209,7 +124,8 @@ final class PCMRecordingWriter {
     }
 
     private func mixedSamples() -> [Float] {
-        if channels.count == 1 { return channels[0] }
+        guard let first = channels.first else { return [] }
+        if channels.count == 1 { return first }
         let frameCount = channels[0].count
         let workers = frameCount > 160000 ? ProcessInfo.processInfo.activeProcessorCount : 1
         let framesPerWorker = frameCount / workers
@@ -222,18 +138,7 @@ final class PCMRecordingWriter {
             let end = worker == workers - 1 ? frameCount : start + framesPerWorker
             for offset in stride(from: start, to: end, by: chunkSize) {
                 let range = offset..<min(offset + chunkSize, end)
-                let active = channels.indices.filter { channel in
-                    var energy: Float = 0
-                    for sample in channels[channel][range] { energy += sample * sample }
-                    return sqrtf(energy / Float(range.count)) > 0.0001
-                }
-                let selected = active.isEmpty ? Array(channels.indices) : active
-                let normalization = 1 / Float(selected.count)
-                for frame in range {
-                    var sample: Float = 0
-                    for channel in selected { sample += channels[channel][frame] }
-                    result.append(sample * normalization)
-                }
+                result.append(contentsOf: ActiveChannelMixer.mix(channels.map { $0[range] }))
             }
         }
         return result

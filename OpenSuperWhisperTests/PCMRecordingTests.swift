@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import GRDB
 import XCTest
 @testable import OpenSuperWhisper
 
@@ -143,23 +144,34 @@ final class PCMRecordingTests: XCTestCase {
     }
 
     /// Interfaces such as the Audient EVO 4 expose 4 inputs (2 mics + 2 loopback) with
-    /// speech only on the first; Parakeet must decode the recorder's mix, not the raw WAV.
+    /// speech only on channel 1. The URL-only queue path must use the same active-channel
+    /// mixer as live capture instead of FluidAudio's generic multi-channel downmix.
     @MainActor
-    func testFluidAudioDecodesPreparedMultiChannelAudioWithoutReadingTheFile() async throws {
+    func testFluidAudioTranscribesQueuedMultiChannelFileUsingSharedMixer() async throws {
         try XCTSkipUnless(ProcessInfo.processInfo.environment["OSW_TEST_FLUIDAUDIO"] == "1",
                           "Downloads Parakeet models")
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         let output = FileManager.default.temporaryDirectory.appendingPathComponent("pcm-4ch-speech-\(UUID()).wav")
         defer { try? FileManager.default.removeItem(at: output) }
-        let audio = try Self.prepare(file: root.appendingPathComponent("jfk.wav"), output: output,
-                                     channelCount: 4)
+        _ = try Self.prepare(file: root.appendingPathComponent("jfk.wav"), output: output,
+                             channelCount: 4)
         let engine = FluidAudioEngine(modelVersion: "v3")
         try await engine.initialize()
         let service = TranscriptionService(engine: engine)
-        let text = try await service.transcribeAudio(
-            url: output.appendingPathExtension("does-not-exist"), settings: Settings(), pcmSamples: audio.samples
-        )
-        XCTAssertTrue(text.lowercased().contains("your country"), text)
+        let store = try RecordingStore(databaseQueue: DatabaseQueue())
+        let queue = TranscriptionQueue(transcriptionService: service, recordingStore: store)
+
+        await queue.addFileToQueue(url: output)
+        for _ in 0..<4_800 where queue.isProcessing {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertFalse(queue.isProcessing, "Queued Parakeet transcription timed out")
+
+        let recordings = try await store.fetchRecordings(limit: 1, offset: 0)
+        let recording = try XCTUnwrap(recordings.first)
+        defer { try? FileManager.default.removeItem(at: recording.url) }
+        XCTAssertEqual(recording.status, .completed, recording.transcription)
+        XCTAssertTrue(recording.transcription.lowercased().contains("your country"), recording.transcription)
     }
 
     /// Writes `input` through the recorder; with `channelCount` > 1 the source goes to

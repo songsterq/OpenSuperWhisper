@@ -19,15 +19,6 @@ final class EmptyDictationDiscardTests: XCTestCase {
         XCTAssertFalse(TranscriptionQueue.shouldDiscardEmptyDictation(text: "", sourceURL: importedFileURL))
     }
 
-    func testEmptyTextFromDurableQueuedDictation_isDiscarded() {
-        let durableURL = Recording.recordingsDirectory.appendingPathComponent("12345.wav")
-        XCTAssertTrue(TranscriptionQueue.shouldDiscardEmptyDictation(
-            text: "",
-            sourceURL: durableURL,
-            preparedPCMFileURL: QueuedPCMFile.url(for: UUID()).path
-        ))
-    }
-
     func testNonEmptyTextFromDictation_isKept() {
         XCTAssertFalse(TranscriptionQueue.shouldDiscardEmptyDictation(text: "hello world", sourceURL: dictationURL))
     }

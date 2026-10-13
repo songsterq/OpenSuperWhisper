@@ -75,11 +75,6 @@ class TranscriptionQueue: ObservableObject {
 
         processingTask = Task {
             do {
-                try await recordingStore.reconcileQueueArtifactLifecycle()
-                AudioRecorder.cleanupOldTemporaryFiles(
-                    in: AudioRecorder.temporaryRecordingsDirectory,
-                    olderThan: AudioRecorder.temporaryFileMaxAge
-                )
                 try await cleanupMissingFiles()
                 try await processQueue()
             } catch is CancellationError {
@@ -117,34 +112,29 @@ class TranscriptionQueue: ObservableObject {
     }
 
     func addFileToQueue(url: URL) async {
-        let duration = await AudioUtil.audioDuration(url: url)
-        await addToQueue(url: url, duration: duration, pcmSamples: nil, errorTitle: "File could not be queued")
-    }
-
-    func addRecordedAudioToQueue(_ audio: RecordedAudio) async {
-        await addToQueue(
-            url: audio.url,
-            duration: audio.duration,
-            pcmSamples: audio.samples,
-            errorTitle: "Recording could not be queued"
-        )
-    }
-
-    private func addToQueue(
-        url: URL,
-        duration: TimeInterval,
-        pcmSamples: [Float]?,
-        errorTitle: String
-    ) async {
         do {
-            try await recordingStore.addQueuedRecording(
-                url: url,
-                duration: duration,
-                pcmSamples: pcmSamples
+            let durationInSeconds = await AudioUtil.audioDuration(url: url)
+
+            let timestamp = Date()
+            let id = UUID()
+            let fileName = Recording.fileName(for: id)
+
+            let recording = Recording(
+                id: id,
+                timestamp: timestamp,
+                fileName: fileName,
+                transcription: "",
+                duration: durationInSeconds,
+                status: .pending,
+                progress: 0.0,
+                sourceFileURL: url.path
             )
+
+            try await recordingStore.addRecordingSync(recording)
+
             startProcessingQueue()
         } catch {
-            AppErrorCenter.shared.report(errorTitle, error: error)
+            AppErrorCenter.shared.report("File could not be queued", error: error)
         }
     }
 
@@ -175,23 +165,20 @@ class TranscriptionQueue: ObservableObject {
             return
         }
 
-        guard try await recordingStore.prepareRecordingForRequeue(
-            recording,
-            sourceURL: sourceURL
-        ) else { return }
+        try await recordingStore.updateRecordingStatusOnly(
+            recording.id,
+            progress: 0.0,
+            status: .pending,
+            isRegeneration: true
+        )
+
+        try await recordingStore.updateSourceFileURL(recording.id, sourceURL: sourceURL.path)
 
         startProcessingQueue()
     }
 
-    nonisolated static func shouldDiscardEmptyDictation(
-        text: String,
-        sourceURL: URL,
-        preparedPCMFileURL: String? = nil
-    ) -> Bool {
-        text.isEmpty && (
-            preparedPCMFileURL != nil ||
-            sourceURL.path.hasPrefix(AudioRecorder.temporaryRecordingsDirectory.path)
-        )
+    nonisolated static func shouldDiscardEmptyDictation(text: String, sourceURL: URL) -> Bool {
+        text.isEmpty && sourceURL.path.hasPrefix(AudioRecorder.temporaryRecordingsDirectory.path)
     }
 
     private func processQueue() async throws {
@@ -268,26 +255,13 @@ class TranscriptionQueue: ObservableObject {
                 }
 
                 let settings = Settings()
-                let pcmSamples: [Float]? = try await Task.detached(priority: .userInitiated) {
-                    guard let path = recording.preparedPCMFileURL else { return nil }
-                    return try QueuedPCMFile.read(from: URL(fileURLWithPath: path))
-                }.value
-                let text = try await transcriptionService.transcribeAudio(
-                    url: sourceURL,
-                    settings: settings,
-                    operationID: operationID,
-                    pcmSamples: pcmSamples
-                )
+                let text = try await transcriptionService.transcribeAudio(url: sourceURL, settings: settings, operationID: operationID)
 
                 if isRecordingCancelled(recording.id) || Task.isCancelled {
                     return
                 }
 
-                if Self.shouldDiscardEmptyDictation(
-                    text: text,
-                    sourceURL: sourceURL,
-                    preparedPCMFileURL: recording.preparedPCMFileURL
-                ) {
+                if Self.shouldDiscardEmptyDictation(text: text, sourceURL: sourceURL) {
                     await Task.detached(priority: .utility) {
                         try? FileManager.default.removeItem(at: sourceURL)
                     }.value
@@ -313,7 +287,13 @@ class TranscriptionQueue: ObservableObject {
                     }
                 }.value
 
-                try await recordingStore.completeRecording(recording, transcription: text)
+                try await recordingStore.updateRecordingProgressOnlySync(
+                    recording.id,
+                    transcription: text,
+                    progress: 1.0,
+                    status: .completed,
+                    isRegeneration: false
+                )
 
             } catch {
                 if !isRecordingCancelled(recording.id) && !Task.isCancelled {

@@ -2,25 +2,6 @@ import XCTest
 import GRDB
 @testable import OpenSuperWhisper
 
-private enum LegacyRecordingStatus: String, Decodable, Equatable {
-    case pending
-    case converting
-    case transcribing
-    case completed
-    case failed
-}
-
-private struct LegacyRecording: Decodable, FetchableRecord {
-    let id: UUID
-    let timestamp: Date
-    let fileName: String
-    let transcription: String
-    let duration: TimeInterval
-    let status: LegacyRecordingStatus
-    let progress: Float
-    let sourceFileURL: String?
-}
-
 @MainActor
 final class RecordingStorageFailureTests: XCTestCase {
     func testUnavailableDatabaseReportsErrorInsteadOfCrashing() async throws {
@@ -35,7 +16,7 @@ final class RecordingStorageFailureTests: XCTestCase {
         } catch {}
     }
 
-    func testFailedDeletionLeavesRetryableTombstone() async throws {
+    func testFailedDeletionPreservesAudioDatabaseAndVisibleRow() async throws {
         let db = try DatabaseQueue()
         let store = try RecordingStore(databaseQueue: db)
         let id = UUID()
@@ -58,31 +39,14 @@ final class RecordingStorageFailureTests: XCTestCase {
         }
         XCTAssertNotNil(AppErrorCenter.shared.issue)
         XCTAssertEqual(vm.recordings.map(\.id), [id])
-        XCTAssertFalse(FileManager.default.fileExists(atPath: row.url.path))
+        XCTAssertEqual(try Data(contentsOf: row.url), Data([1, 2, 3]))
         do {
             try await store.deleteAllRecordingsSync()
             XCTFail("Deletion should fail")
         } catch {}
+        XCTAssertTrue(FileManager.default.fileExists(atPath: row.url.path))
         let rows = try await store.fetchRecordings(limit: 10, offset: 0)
         XCTAssertEqual(rows.map(\.id), [id])
-        XCTAssertEqual(rows.first?.status, .completed)
-        XCTAssertEqual(rows.first?.deletionState, .deleting)
-        let legacyRow = try await db.read { db in
-            try LegacyRecording.fetchOne(
-                db,
-                sql: "SELECT * FROM recordings WHERE id = ?",
-                arguments: [id]
-            )
-        }
-        XCTAssertEqual(legacyRow?.id, id)
-        XCTAssertEqual(legacyRow?.status, .completed)
-
-        try await db.write { db in
-            try db.execute(sql: "DROP TRIGGER reject_delete")
-        }
-        try await store.retryDeletingRecordings()
-        let remaining = try await store.fetchRecordings(limit: 10, offset: 0)
-        XCTAssertTrue(remaining.isEmpty)
     }
 
     func testFailedInsertIsReturnedToCaller() async throws {

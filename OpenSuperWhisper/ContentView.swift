@@ -776,8 +776,7 @@ struct RecordingRow: View {
     }
     
     private var isPending: Bool {
-        recording.status == .pending || recording.status == .converting ||
-            recording.status == .transcribing || recording.deletionState != nil
+        recording.status == .pending || recording.status == .converting || recording.status == .transcribing
     }
     
     private var isRegenerating: Bool {
@@ -785,9 +784,6 @@ struct RecordingRow: View {
     }
     
     private var statusText: String {
-        if recording.deletionState != nil {
-            return "Deleting..."
-        }
         switch recording.status {
         case .pending:
             return "In queue..."
