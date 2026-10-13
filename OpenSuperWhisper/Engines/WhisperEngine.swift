@@ -119,7 +119,16 @@ class WhisperEngine: TranscriptionEngine {
     }
     
     func transcribeAudio(url: URL, settings: Settings) async throws -> String {
-        try await transcribeAudioDetailed(url: url, settings: settings).text
+        abortFlag.isSet = false
+        guard let samples = try await convertAudioToPCM(
+            fileURL: url,
+            cancellationCheck: { [abortFlag] in abortFlag.isSet }
+        ) else {
+            if abortFlag.isSet || Task.isCancelled { throw CancellationError() }
+            throw TranscriptionError.audioConversionFailed
+        }
+        if abortFlag.isSet { throw CancellationError() }
+        return try await transcribeSamples(samples, settings: settings)
     }
 
     /// Internal detailed result used by long-form regression tests. Production
@@ -610,44 +619,11 @@ class WhisperEngine: TranscriptionEngine {
     private nonisolated func appendMixedSamples(from buffer: AVAudioPCMBuffer, to output: inout [Float]) {
         let frameCount = Int(buffer.frameLength)
         guard frameCount > 0, let channelData = buffer.floatChannelData else { return }
-        
-        let channelCount = Int(buffer.format.channelCount)
-        if channelCount == 1 {
-            let mono = UnsafeBufferPointer(start: channelData[0], count: frameCount)
-            output.append(contentsOf: mono)
-            return
+
+        let channels = (0..<Int(buffer.format.channelCount)).map {
+            UnsafeBufferPointer(start: channelData[$0], count: frameCount)
         }
-        
-        let activityThreshold: Float = 0.0001
-        var activeChannels: [Int] = []
-        activeChannels.reserveCapacity(channelCount)
-        
-        for channel in 0..<channelCount {
-            let channelSamples = UnsafeBufferPointer(start: channelData[channel], count: frameCount)
-            var energy: Float = 0
-            for sample in channelSamples {
-                energy += sample * sample
-            }
-            let rms = sqrtf(energy / Float(frameCount))
-            if rms > activityThreshold {
-                activeChannels.append(channel)
-            }
-        }
-        
-        if activeChannels.isEmpty {
-            activeChannels = Array(0..<channelCount)
-        }
-        
-        let normalization = 1.0 / Float(activeChannels.count)
-        output.reserveCapacity(output.count + frameCount)
-        
-        for frame in 0..<frameCount {
-            var mixed: Float = 0
-            for channel in activeChannels {
-                mixed += channelData[channel][frame]
-            }
-            output.append(mixed * normalization)
-        }
+        output.append(contentsOf: ActiveChannelMixer.mix(channels))
     }
     
     nonisolated func makeTargetFormat(channelCount: AVAudioChannelCount) -> AVAudioFormat? {

@@ -13,6 +13,38 @@ struct RecordingCaptureError: Error {
     let underlying: Error
 }
 
+enum ActiveChannelMixer {
+    private static let activityThreshold: Float = 0.0001
+
+    /// Mixes equally-sized channel buffers while excluding channels that are
+    /// effectively silent for this buffer. Keeping this logic shared ensures
+    /// live capture and file decoding make the same channel-selection choice.
+    static func mix<Channel>(_ channels: [Channel]) -> [Float]
+    where Channel: RandomAccessCollection, Channel.Element == Float, Channel.Index == Int {
+        guard let first = channels.first, !first.isEmpty,
+              channels.allSatisfy({ $0.startIndex == first.startIndex && $0.endIndex == first.endIndex }) else {
+            return []
+        }
+        if channels.count == 1 { return Array(first) }
+
+        let active = channels.indices.filter { channel in
+            var energy: Float = 0
+            for sample in channels[channel] { energy += sample * sample }
+            return sqrtf(energy / Float(first.count)) > activityThreshold
+        }
+        let selected = active.isEmpty ? Array(channels.indices) : active
+        let normalization = 1 / Float(selected.count)
+        var result: [Float] = []
+        result.reserveCapacity(first.count)
+        for frame in first.indices {
+            var sample: Float = 0
+            for channel in selected { sample += channels[channel][frame] }
+            result.append(sample * normalization)
+        }
+        return result
+    }
+}
+
 final class PCMRecordingWriter {
     private let url: URL
     private var file: AVAudioFile?
@@ -92,7 +124,8 @@ final class PCMRecordingWriter {
     }
 
     private func mixedSamples() -> [Float] {
-        if channels.count == 1 { return channels[0] }
+        guard let first = channels.first else { return [] }
+        if channels.count == 1 { return first }
         let frameCount = channels[0].count
         let workers = frameCount > 160000 ? ProcessInfo.processInfo.activeProcessorCount : 1
         let framesPerWorker = frameCount / workers
@@ -105,18 +138,7 @@ final class PCMRecordingWriter {
             let end = worker == workers - 1 ? frameCount : start + framesPerWorker
             for offset in stride(from: start, to: end, by: chunkSize) {
                 let range = offset..<min(offset + chunkSize, end)
-                let active = channels.indices.filter { channel in
-                    var energy: Float = 0
-                    for sample in channels[channel][range] { energy += sample * sample }
-                    return sqrtf(energy / Float(range.count)) > 0.0001
-                }
-                let selected = active.isEmpty ? Array(channels.indices) : active
-                let normalization = 1 / Float(selected.count)
-                for frame in range {
-                    var sample: Float = 0
-                    for channel in selected { sample += channels[channel][frame] }
-                    result.append(sample * normalization)
-                }
+                result.append(contentsOf: ActiveChannelMixer.mix(channels.map { $0[range] }))
             }
         }
         return result
