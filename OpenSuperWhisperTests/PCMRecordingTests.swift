@@ -172,6 +172,21 @@ final class PCMRecordingTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: recording.url) }
         XCTAssertEqual(recording.status, .completed, recording.transcription)
         XCTAssertTrue(recording.transcription.lowercased().contains("your country"), recording.transcription)
+
+        let persistedAudio = try AVAudioFile(forReading: recording.url)
+        XCTAssertEqual(recording.url.pathExtension.lowercased(), "wav")
+        XCTAssertEqual(persistedAudio.processingFormat.channelCount, 4)
+        let evidence = """
+        queue_status: \(recording.status.rawValue)
+        persisted_audio: WAV
+        persisted_channels: \(persistedAudio.processingFormat.channelCount)
+        speech_channel: 1
+        parakeet_transcription: \(recording.transcription)
+        """
+        let attachment = XCTAttachment(string: evidence)
+        attachment.name = "queued-four-channel-parakeet-evidence"
+        attachment.lifetime = .keepAlways
+        add(attachment)
     }
 
     /// Writes `input` through the recorder; with `channelCount` > 1 the source goes to
